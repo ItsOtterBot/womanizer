@@ -1,0 +1,5 @@
+# MSRV pin per the project spec (§ Version Compatibility: set MSRV to 1.82 for WASAPI on Windows).
+# rustup auto-installs this toolchain on first cargo invocation.
+[toolchain]
+channel = "1.82"
+components = ["clippy", "rustfmt"]

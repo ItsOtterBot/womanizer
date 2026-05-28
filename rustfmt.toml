@@ -1,0 +1,3 @@
+# Defaults are fine for this project; pin the edition so `rustfmt --check` (CI merge gate
+# D-10) is deterministic across toolchains.
+edition = "2021"
