@@ -1,0 +1,16 @@
+[package]
+name = "womanizer-core"
+version = "0.1.0"
+edition = "2021"
+
+# Cross-thread plumbing primitives + VoiceParams contract. No DB, no egui — must stay
+# unit-testable in isolation (D-01). The `smoke` module (run_smoke_test harness) lands in
+# Plan 02 against the contracts declared here.
+[dependencies]
+rtrb = { workspace = true }
+triple_buffer = { workspace = true }
+atomic_float = { workspace = true }
+crossbeam-channel = { workspace = true }
+assert_no_alloc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

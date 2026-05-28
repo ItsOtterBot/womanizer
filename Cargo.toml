@@ -4,13 +4,23 @@
 # with `workspace = true` from each member crate (D-01 layering + single-source pinning).
 #
 # CONSCIOUS DIVERGENCE FROM the project spec PINS (per the stack research § Version Drift, Open Question 1):
-#   the project spec authored older pins; we follow current-latest verified on crates.io 2026-05-28.
-#     - triple_buffer  8   -> 9    (MAJOR bump; 9.0 (Input, Output)+write/read API verified
-#                                   compatible with the smoke-test usage in Plan 02)
-#     - rusqlite       0.39 -> 0.40 (published 2026-05-26; current)
+#   the project spec authored older pins; we follow current-latest verified on crates.io 2026-05-28
+#   EXCEPT where the MSRV-1.82 constraint or the resolver forces the project spec's original pin:
 #     - directories    5   -> 6    (ProjectDirs::from + data_dir() API stable across 5->6)
 #     - rtrb           0.3.3 -> 0.3.4 (patch)
 #   These are deliberate, not accidental drift.
+#
+# triple_buffer is held at the project spec's 8 (NOT the the stack research 9 verdict): triple_buffer 9.0.0
+# requires Rust edition 2024 (Cargo >= 1.85), which is incompatible with our MSRV-1.82 pin
+# (a hard the project spec constraint). 8.x is the latest MSRV-1.82-compatible release and its
+# (Input, Output) + write/read API matches the Plan-02 smoke-test usage. the stack research Pitfall 3
+# asserted 9.0 was compatible; that was an error — MSRV wins. (Rule 3 blocking-issue fix.)
+#
+# rusqlite is held at the project spec's 0.39 (NOT the the stack research 0.40 verdict): rusqlite_migration
+# (mandated by D-06) tops out at 2.5.0, which depends on rusqlite ^0.39 (libsqlite3-sys 0.37).
+# Pulling rusqlite 0.40 (libsqlite3-sys 0.38) makes two packages claim links="sqlite3" and the
+# resolver rejects it. 0.39 aligns both on libsqlite3-sys 0.37. Revisit 0.40 when
+# rusqlite_migration adds 0.40 support. (Rule 3 blocking-issue fix.)
 #
 # assert_no_alloc uses features = ["warn_debug"] (per RESEARCH A1) so the INFRA-03 violation
 # test can catch the allocation via a #[should_panic] (default behavior aborts, not catchable).
@@ -29,14 +39,16 @@ members = [
 [workspace.dependencies]
 # --- Core cross-thread plumbing (womanizer-core) ---
 rtrb = "0.3.4"
-triple_buffer = "9"
+triple_buffer = "8"
 atomic_float = "1"
 crossbeam-channel = "0.5"
 assert_no_alloc = { version = "1", features = ["warn_debug"] }
 
 # --- Persistence (womanizer-db) ---
-rusqlite = { version = "0.40", features = ["bundled"] }
-rusqlite_migration = "2"
+rusqlite = { version = "0.39", features = ["bundled"] }
+# Pin to 2.5 (latest): bare "2" resolves to 2.0.0 (rusqlite ^0.34); 2.5.0 depends on
+# rusqlite ^0.39, matching our pin so both share libsqlite3-sys 0.37 (one links="sqlite3").
+rusqlite_migration = "2.5"
 directories = "6"
 
 # --- Serialization ---
