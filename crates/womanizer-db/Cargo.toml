@@ -1,0 +1,15 @@
+[package]
+name = "womanizer-db"
+version = "0.1.0"
+edition = "2021"
+
+# Voice-library + settings persistence. Depends on womanizer-core for the VoiceParams contract
+# (db -> core, D-01 dependency direction). Schema/migrations/seed land in Plan 03; this is a
+# compilable skeleton with the dependency graph wired so the license gate is real.
+[dependencies]
+womanizer-core = { path = "../womanizer-core" }
+rusqlite = { workspace = true }
+rusqlite_migration = { workspace = true }
+directories = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

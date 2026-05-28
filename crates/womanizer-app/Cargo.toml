@@ -1,0 +1,22 @@
+[package]
+name = "womanizer-app"
+version = "0.1.0"
+edition = "2021"
+
+# The single shipped binary. The only crate where #[global_allocator] (assert_no_alloc) and
+# eframe live, so the library crates stay egui-free and unit-testable (D-01).
+[[bin]]
+name = "womanizer"
+path = "src/main.rs"
+
+# app -> {core, db} (D-01 dependency direction). eframe/egui are declared so the REAL GUI
+# binary builds cross-platform per Open Question 2 / INFRA-01; they are NOT wired in Phase 0
+# (no window, no allocator registration, no DB open — those land in Plan 04).
+[dependencies]
+womanizer-core = { path = "../womanizer-core" }
+womanizer-db = { path = "../womanizer-db" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }

@@ -1,5 +1,13 @@
-# MSRV pin per the project spec (§ Version Compatibility: set MSRV to 1.82 for WASAPI on Windows).
+# MSRV pin 1.92 — the mandated-dependency floor.
+# the project spec set 1.82 as cpal's WASAPI *minimum* (a floor, not a ceiling); 1.92 still satisfies it.
+# The approved Rule-4 decision raised the floor to whatever the mandated 2026 crate versions need
+# in ONE durable change (rather than pinning deep transitive crates down individually, which does
+# not satisfy INFRA-01's "builds from a clean checkout" intent). edition2024 (rustc 1.85) is the
+# rusqlite_migration 2.5 floor, but the binding constraint is the egui/eframe 0.34.3 transitive
+# tree — egui/eframe 0.34.3 declare rust-version 1.92, and their wgpu 29 / naga 29 / icu 2.2 deps
+# require 1.86-1.88. The MSRV-aware resolver therefore needs 1.92 to resolve a clean checkout.
+# The installed environment toolchain is well above this. See 00-01-SUMMARY.md Deviations (Rule 4).
 # rustup auto-installs this toolchain on first cargo invocation.
 [toolchain]
-channel = "1.82"
+channel = "1.92"
 components = ["clippy", "rustfmt"]
