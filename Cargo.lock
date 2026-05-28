@@ -4376,6 +4376,7 @@ dependencies = [
 name = "womanizer-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assert_no_alloc",
  "atomic_float",
  "crossbeam-channel",

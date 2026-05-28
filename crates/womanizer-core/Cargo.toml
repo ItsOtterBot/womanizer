@@ -14,3 +14,7 @@ crossbeam-channel = { workspace = true }
 assert_no_alloc = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# The reusable smoke harness (Plan 02) returns anyhow::Result; pinned once in
+# [workspace.dependencies]. thiserror remains the library error idiom; anyhow is used here
+# for the harness's aggregate "any primitive failed to shuttle" result.
+anyhow = { workspace = true }

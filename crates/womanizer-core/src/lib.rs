@@ -10,12 +10,13 @@
 //! - [`wake`]: [`DspWakeHandle`] — allocation-free, lock-free park/unpark wake.
 //! - [`error_ring`]: [`EngineError`] (Copy, no heap) + [`ErrorRing`] constructor.
 //!
-//! The `smoke` module (the reusable end-to-end harness, D-12) is added in Plan 02 — it is
-//! intentionally NOT declared here.
+//! - [`smoke`]: [`run_smoke_test`](smoke::run_smoke_test) — the reusable end-to-end plumbing
+//!   harness (D-12) that instantiates all nine named primitives and shuttles dummy frames.
 
 pub mod error_ring;
 pub mod params;
 pub mod primitives;
+pub mod smoke;
 pub mod wake;
 
 // Re-export the cross-phase contract surface at the crate root so downstream crates can
