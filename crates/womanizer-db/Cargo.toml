@@ -2,6 +2,9 @@
 name = "womanizer-db"
 version = "0.1.0"
 edition = "2021"
+# OtterBot-internal workspace crate — never published to crates.io. `publish = false` is accurate
+# metadata and lets `cargo-deny` skip license evaluation for first-party crates ([licenses] private).
+publish = false
 
 # Voice-library + settings persistence. Depends on womanizer-core for the VoiceParams contract
 # (db -> core, D-01 dependency direction). Schema/migrations/seed land in Plan 03; this is a

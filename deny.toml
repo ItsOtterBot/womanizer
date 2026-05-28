@@ -1,0 +1,66 @@
+# cargo-deny configuration — supply-chain + license gate (INFRA-02).
+#
+# This enforces the no-GPL boundary (the project spec "License obligations" / D-02 / D-03) MECHANICALLY
+# from Phase 0 on a clean codebase: the OtterBot main-app binary may only link permissively-
+# licensed crates. The rebranded BlackHole HAL plugin (GPL-3.0) is deliberately NOT a Cargo
+# dependency (it lives outside the Rust dep graph in drivers/), so cargo-deny never sees it and
+# the GPL obligation is handled separately (D-02). This file scans only first-party + permissive
+# transitive crates.
+#
+# cargo-deny v2 license semantics: anything NOT in `allow` is DENIED. GPL/AGPL/LGPL are simply
+# ABSENT from the allow-list below — that absence is the denial (D-03). Do NOT add a GPL/AGPL/LGPL
+# identifier to any allow path to force a pass; if one ever appears in the tree it MUST surface as
+# a failing check, not be masked.
+#
+# Pitfall 1 (the stack research): SPDX identifiers are EXACT. There is no bare "BSD" SPDX id — the
+# valid ids are BSD-1-Clause / BSD-2-Clause / BSD-3-Clause. assert_no_alloc 1.1.2 is BSD-1-Clause.
+# Using literal "BSD" breaks the first run. The allow-list below was validated locally against the
+# resolved workspace dep graph with `cargo deny check licenses` (cargo-deny 0.19.8, cargo 1.92.0).
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+
+# First-party OtterBot workspace crates (womanizer-app / -core / -db) carry no `license` field
+# (they are never published to crates.io) and would otherwise fail as "unlicensed". `private` with
+# `ignore = true` skips license evaluation for workspace-internal, unpublished crates — the
+# canonical EmbarkStudios pattern. Third-party crates are still fully gated. (Rule 3 config fix.)
+private = { ignore = true }
+
+# Exact SPDX identifiers present in the resolved workspace dep graph (egui/eframe/cpal/wgpu/icu
+# tree + first-party crates). Trimmed/extended to exactly what `cargo deny check licenses` reports.
+# EVERY id below is permissive or public-domain-equivalent. GPL/AGPL/LGPL are deliberately ABSENT
+# (their absence is the denial in cargo-deny v2). Nothing copyleft was found in the resolved tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",       # assert_no_alloc (Pitfall 1 — NOT a bare "BSD")
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",            # audio_thread_priority (transitive via cpal), triple_buffer
+    "Unicode-3.0",        # ICU / unicode-* crates in the egui text stack
+    "Unlicense",
+    "BSL-1.0",            # Boost Software License — clipboard-win, error-code (egui clipboard path)
+    "CC0-1.0",            # Creative Commons Zero (public-domain dedication) — hexf-parse
+    "OFL-1.1",            # SIL Open Font License — epaint_default_fonts (egui's bundled fonts)
+    "Ubuntu-font-1.0",    # Ubuntu Font License — epaint_default_fonts (egui's bundled fonts)
+]
+
+[sources]
+# Supply-chain hardening (Security Domain T-00-09): only the canonical crates.io registry and
+# vetted git sources are allowed; anything else fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[bans]
+# Advisory only — multiple-versions is common in a large GUI tree and is NOT a required merge gate
+# (implementer's discretion). Surfaced as a warning to keep the dep graph visible, not to block.
+multiple-versions = "warn"
+
+[advisories]
+# RUSTSEC advisories are tracked but kept ADVISORY-ONLY in Phase 0 (implementer's discretion). The
+# REQUIRED merge gate in CI is `cargo deny check licenses`; advisories are not a blocking check here.
+version = 2

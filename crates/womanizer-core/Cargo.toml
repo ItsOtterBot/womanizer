@@ -2,6 +2,9 @@
 name = "womanizer-core"
 version = "0.1.0"
 edition = "2021"
+# OtterBot-internal workspace crate — never published to crates.io. `publish = false` is accurate
+# metadata and lets `cargo-deny` skip license evaluation for first-party crates ([licenses] private).
+publish = false
 
 # Cross-thread plumbing primitives + VoiceParams contract. No DB, no egui — must stay
 # unit-testable in isolation (D-01). The `smoke` module (run_smoke_test harness) lands in

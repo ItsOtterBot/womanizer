@@ -1,0 +1,82 @@
+# Womanizer CI — supply-chain + build-integrity gate (INFRA-01 / INFRA-02).
+#
+# Two jobs make up the merge gate that branch protection on `main` must REQUIRE (Pitfall 4):
+#   1. build-test  — a two-OS NATIVE matrix proving the single binary builds + tests on BOTH
+#                    x86_64-pc-windows-msvc (windows-latest) and aarch64-apple-darwin (macos-14,
+#                    Apple Silicon). Native, NOT cross-compiled (Pitfall 6). Runs fmt --check,
+#                    clippy -D warnings, release build, and the full test suite (incl. the
+#                    assert_no_alloc no-alloc guard + smoke + db tests) — the full gate (D-10).
+#   2. license-gate — runs `cargo deny check licenses` against the resolved workspace dep graph
+#                    via the audited EmbarkStudios/cargo-deny-action@v2, enforcing the no-GPL
+#                    boundary (D-02 / D-03 / INFRA-02). Reads the repo-root deny.toml.
+#
+# Toolchain is pinned to 1.92 to match rust-toolchain.toml (authoritative MSRV — the egui/eframe
+# 0.34.3 tree declares rust-version 1.92; a 1.82 toolchain cannot resolve a clean checkout). This
+# supersedes the older 1.82 reference in the plan's <interfaces> block (rust-toolchain.toml wins).
+# Uses dtolnay/rust-toolchain (the maintained action), NOT the deprecated actions-rs/* actions.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to keep the queue lean.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.92 (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@1.92
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: rustfmt (check)
+        run: cargo fmt --all --check
+
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: build (release, native target)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: test (full suite incl. no-alloc guard)
+        run: cargo test --all
+
+  license-gate:
+    name: license-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (check licenses)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

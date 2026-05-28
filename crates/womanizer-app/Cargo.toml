@@ -2,6 +2,9 @@
 name = "womanizer-app"
 version = "0.1.0"
 edition = "2021"
+# OtterBot-internal workspace crate — never published to crates.io. `publish = false` is accurate
+# metadata and lets `cargo-deny` skip license evaluation for first-party crates ([licenses] private).
+publish = false
 
 # The single shipped binary. The only crate where #[global_allocator] (assert_no_alloc) and
 # eframe live, so the library crates stay egui-free and unit-testable (D-01).
