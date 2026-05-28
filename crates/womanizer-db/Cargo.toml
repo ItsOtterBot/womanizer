@@ -13,3 +13,6 @@ rusqlite_migration = { workspace = true }
 directories = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# open_and_init() returns anyhow::Result (path resolution + migrate + seed can fail in
+# several distinct ways; anyhow is the right error type for the crate's public entrypoint).
+anyhow = { workspace = true }
