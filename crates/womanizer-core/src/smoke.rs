@@ -9,7 +9,7 @@
 //! mode without rework (D-12; the subcommand itself is deferred). The `stub_dsp_callback` is
 //! written *as if* it ran on the RT thread (no allocation, no lock, no channel, no log) and is
 //! wrapped in [`assert_no_alloc`](assert_no_alloc::assert_no_alloc) so the RT-safe contract is
-//! exercised from day one (the project spec "What NOT to Use").
+//! exercised from day one.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

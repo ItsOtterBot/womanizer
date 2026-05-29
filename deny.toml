@@ -1,6 +1,6 @@
 # cargo-deny configuration — supply-chain + license gate (INFRA-02).
 #
-# This enforces the no-GPL boundary (the project spec "License obligations" / D-02 / D-03) MECHANICALLY
+# This enforces the no-GPL boundary (License obligations / D-02 / D-03) MECHANICALLY
 # from Phase 0 on a clean codebase: the OtterBot main-app binary may only link permissively-
 # licensed crates. The rebranded BlackHole HAL plugin (GPL-3.0) is deliberately NOT a Cargo
 # dependency (it lives outside the Rust dep graph in drivers/), so cargo-deny never sees it and
@@ -12,7 +12,7 @@
 # identifier to any allow path to force a pass; if one ever appears in the tree it MUST surface as
 # a failing check, not be masked.
 #
-# Pitfall 1 (the stack research): SPDX identifiers are EXACT. There is no bare "BSD" SPDX id — the
+# SPDX identifiers are EXACT (Pitfall 1): there is no bare "BSD" SPDX id — the
 # valid ids are BSD-1-Clause / BSD-2-Clause / BSD-3-Clause. assert_no_alloc 1.1.2 is BSD-1-Clause.
 # Using literal "BSD" breaks the first run. The allow-list below was validated locally against the
 # resolved workspace dep graph with `cargo deny check licenses` (cargo-deny 0.19.8, cargo 1.92.0).

@@ -4,7 +4,7 @@
 //! speaks in domain terms (`InputRing`, `VirtualOutRing`) and a refactor of the underlying
 //! primitive stays local (Pattern 1; anti-pattern: bare `rtrb::Producer<f32>` passed around).
 //!
-//! Audio-path safety (the project spec "What NOT to Use"): the rings are wait-free `rtrb` SPSC pairs;
+//! Audio-path safety: the rings are wait-free `rtrb` SPSC pairs;
 //! hot scalars are atomics; [`EngineCommand`]/[`EngineEvent`] travel over `crossbeam-channel`
 //! and are **off-audio-thread only** (discrete commands, never a parameter stream).
 

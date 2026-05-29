@@ -2,7 +2,7 @@
 //!
 //! Lets the capture callback signal the DSP worker "data ready, wake up" without blocking the
 //! RT thread and without per-wake allocation. `crossbeam-channel` is explicitly forbidden on
-//! the audio path (the project spec "What NOT to Use"); `std::thread::park`/`unpark` is the
+//! the audio path; `std::thread::park`/`unpark` is the
 //! standard-library, allocation-free primitive for exactly this handshake.
 
 use std::sync::atomic::{AtomicBool, Ordering};

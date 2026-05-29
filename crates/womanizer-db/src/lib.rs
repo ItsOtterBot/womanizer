@@ -28,8 +28,8 @@ pub mod seed;
 
 pub use seed::seed_default_if_empty;
 
-/// SQLite database filename under the resolved app-data directory (implementer's discretion, D per
-/// RESEARCH). `.sqlite3` makes the format obvious to anyone inspecting the app-data folder.
+/// SQLite database filename under the resolved app-data directory.
+/// `.sqlite3` makes the format obvious to anyone inspecting the app-data folder.
 pub const DB_FILENAME: &str = "womanizer.sqlite3";
 
 /// Open the voice database at the canonical app-data location, migrate it to the latest
