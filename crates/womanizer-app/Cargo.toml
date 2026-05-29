@@ -12,14 +12,18 @@ publish = false
 name = "womanizer"
 path = "src/main.rs"
 
-# app -> {core, db} (D-01 dependency direction). eframe/egui are declared so the REAL GUI
-# binary builds cross-platform per Open Question 2 / INFRA-01; they are NOT wired in Phase 0
-# (no window, no allocator registration, no DB open — those land in Plan 04).
+# app -> {core, db} (D-01 dependency direction). The binary owns the #[global_allocator]
+# registration (assert_no_alloc, debug-only), tracing init, and the first-launch DB open.
+# eframe/egui are declared so the REAL GUI binary's dep graph builds cross-platform per
+# Open Question 2 / INFRA-01; they are NOT wired yet (no window — that lands in a later phase).
 [dependencies]
 womanizer-core = { path = "../womanizer-core" }
 womanizer-db = { path = "../womanizer-db" }
+assert_no_alloc = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+# `env-filter` adds `EnvFilter` so log verbosity is controllable via `RUST_LOG` for local
+# debugging; it is not part of tracing-subscriber's default feature set.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 eframe = { workspace = true }
 egui = { workspace = true }
