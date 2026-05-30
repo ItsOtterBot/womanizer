@@ -29,6 +29,7 @@ members = [
     "crates/womanizer-core",
     "crates/womanizer-db",
     "crates/womanizer-app",
+    "crates/womanizer-engine",
 ]
 
 [workspace.dependencies]
@@ -60,6 +61,22 @@ tracing-subscriber = "0.3"
 
 # --- Declared so the dep graph + license gate are real and INFRA-01 proves the ACTUAL
 #     binary builds on both OSes (Open Question 2). NOT wired in Phase 0. ---
-cpal = "0.17"
+# Phase 1 (Plan 01-01): the cpal `audio_thread_priority` feature is OPTIONAL in cpal 0.17.3 and
+# MUST be opted in explicitly here (D-20). Without this feature the audio callback thread is not
+# promoted to RT priority (MMCSS "Pro Audio" on Win, time-constraint on Mac) and the < 50 ms
+# latency budget is unreachable. CLAUDE.md's "automatic in 0.17.x" refers to the *availability*
+# of the integration, not the default-feature state.
+cpal = { version = "0.17", features = ["audio_thread_priority"] }
 eframe = "0.34"
 egui = "0.34"
+
+# --- Phase 1 (Plan 01-01) audio I/O additions ---
+# D-05 (revised): rubato runs the I/O-boundary sample-rate conversion. Pin EXACT patch 0.16.2 —
+# rubato 1.0+ removed `FftFixedIn` for a new `Fft + FixedSync::Input` API (FINDING-3); 0.16.2 keeps
+# the API the spec was written against (RESEARCH revision W7 — patch pin prevents silent 0.16.3+
+# drift). MIT.
+rubato = "0.16.2"
+# D-19: VB-CABLE detection on Windows uses the strict case-insensitive regex
+# `^CABLE Input \(VB-Audio Virtual Cable\)$`. Only consumed under cfg(target_os = "windows") by
+# `womanizer-engine`. MIT/Apache-2.0.
+regex = "1"

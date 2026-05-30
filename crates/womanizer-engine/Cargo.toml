@@ -1,0 +1,39 @@
+[package]
+name = "womanizer-engine"
+version = "0.1.0"
+edition = "2021"
+# OtterBot-internal workspace crate — never published to crates.io. `publish = false` is accurate
+# metadata and lets `cargo-deny` skip license evaluation for first-party crates ([licenses] private).
+publish = false
+
+# Phase 1 (Plan 01-01): cpal audio I/O, the DSP worker thread (Phase 1 = memcpy passthrough;
+# Phase 2+ = signalsmith), the rubato I/O-boundary resampler, per-OS virtual-device detection
+# (BlackHole rebrand presence on macOS / VB-CABLE on Windows), the self-monitor stream +
+# feedback-loop detector, and the off-RT event loop. Stays headless: no egui, no SQLite.
+# womanizer-engine -> womanizer-core (D-01 dependency direction). Plans 01-02a/02b/03/04
+# populate the module bodies; this plan only stands up the skeleton + workspace wiring.
+[dependencies]
+womanizer-core = { path = "../womanizer-core" }
+cpal = { workspace = true }
+rubato = { workspace = true }
+rtrb = { workspace = true }
+triple_buffer = { workspace = true }
+atomic_float = { workspace = true }
+crossbeam-channel = { workspace = true }
+assert_no_alloc = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# regex is consumed ONLY by the Windows VB-CABLE detection module (devices/windows.rs)
+# per D-19; cfg-gate it so non-Windows builds stay lean.
+[target.'cfg(target_os = "windows")'.dependencies]
+regex = { workspace = true }
+
+# serial_test is used ONLY by this crate's no-alloc / RT-safety integration tests, which share
+# the process-global assert_no_alloc violation counter. Cargo runs #[test]s in a binary in
+# parallel by default; without serialization, a reset in one test can race the before/after
+# snapshot in the other and flake. Same rationale as crates/womanizer-core/Cargo.toml lines
+# 25-29 — pinned here (not in workspace.dependencies) because no other consumer.
+[dev-dependencies]
+serial_test = "3"
