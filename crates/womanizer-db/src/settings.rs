@@ -78,10 +78,7 @@ mod tests {
     fn read_setting_returns_none_for_missing_key() {
         let conn = open_migrated_in_memory();
         let v = read_setting(&conn, KEY_INPUT_DEVICE_ID).expect("read_setting must not error");
-        assert!(
-            v.is_none(),
-            "missing key must map to Ok(None), got {v:?}"
-        );
+        assert!(v.is_none(), "missing key must map to Ok(None), got {v:?}");
     }
 
     /// A present key must return `Ok(Some(value))`. Inserts a row via parameterized INSERT
