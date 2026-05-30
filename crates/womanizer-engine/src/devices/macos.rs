@@ -91,8 +91,7 @@ pub fn detect() -> DetectionResult {
 
     if !supports_48k_stereo_f32 {
         let result = DetectionResult::NotFound {
-            reason: "Womanizer driver present but does not support 48 kHz stereo f32 output"
-                .into(),
+            reason: "Womanizer driver present but does not support 48 kHz stereo f32 output".into(),
         };
         tracing::info!(?result, "macOS device detection");
         return result;
