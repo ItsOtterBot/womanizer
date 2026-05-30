@@ -44,10 +44,3 @@ regex = { workspace = true }
 [dev-dependencies]
 serial_test = "3"
 regex = { workspace = true }
-
-# `test-util` exposes the `EngineHandle::inject_error` test-only fault-injector to
-# downstream consumers (integration tests, future chaos tests). Always enabled implicitly
-# by `cfg(test)` for in-crate tests; this feature lets future external consumers opt in.
-# Phase 1 has no external consumer — kept for forward-compat with revision-time additions.
-[features]
-test-util = []

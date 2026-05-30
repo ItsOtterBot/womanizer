@@ -90,26 +90,27 @@ pub struct EngineHandle {
     pub hot: Arc<HotParams>,
     /// Shared live telemetry (latency, RMS, xrun count).
     pub tele: Arc<Telemetry>,
-    /// Test-only ErrorRing producer the integration test uses to synthesize a fault.
+    /// ErrorRing producer the engine drains on every 50 ms tick alongside the per-Start
+    /// capture / virtual-output rings. The principal consumer is the integration test in
+    /// `tests/reconnect.rs` (AUDIO-09 ground truth — synthesize a `DeviceFault` without a
+    /// real device disconnect) and any future chaos / sleep-wake harness in Phase 5.
     ///
-    /// The real RT-side `error_callback` in `cpal_io::build_*_stream` owns its own
-    /// per-Start ErrorRing producer halves; the engine's `Engine::drain_error_ring`
-    /// drains those AND this injection ring on every 50 ms tick. Gated
-    /// `#[cfg(any(test, feature = "test-util"))]` so the helper is invisible to the
-    /// release binary; `tests/reconnect.rs` uses it without exposing fault-injection
-    /// to UI code.
+    /// Always present (not feature-gated) because Phase 1's verify gate runs the AUDIO-09
+    /// integration test as `cargo test -p womanizer-engine --test reconnect` — without a
+    /// feature flag — and external integration tests can't reach `#[cfg(test)]`-only
+    /// items. The production UI never calls `inject_error`; the field's cost is one
+    /// `Mutex<rtrb::Producer<EngineError>>` (~ tens of bytes) per Engine instance.
     ///
-    /// `Mutex` wrap is purely so the handle stays `Send + Sync + Clone`; rtrb
+    /// The `Mutex` wrap is purely to keep the handle `Send + Sync + Clone`; rtrb
     /// `Producer` is `!Sync` by construction.
-    #[cfg(any(test, feature = "test-util"))]
     pub err_inject_tx: Arc<std::sync::Mutex<Producer<EngineError>>>,
 }
 
 impl EngineHandle {
     /// Inject a synthetic engine error into the persistent injection ring the event loop
     /// drains on every 50 ms tick. Used by `tests/reconnect.rs` to exercise the AUDIO-09
-    /// path without a real device disconnect.
-    #[cfg(any(test, feature = "test-util"))]
+    /// path without a real device disconnect. Production UI must NOT call this — it is a
+    /// test/diagnostic hook.
     pub fn inject_error(&self, e: EngineError) {
         let mut tx = self.err_inject_tx.lock().expect("err_inject_tx mutex");
         // Best-effort: if the ring is full the engine has plenty to drain; dropping a
@@ -507,16 +508,7 @@ pub fn spawn(
     // consumer is owned exclusively by the engine thread.
     let (inject_err_tx, inject_err_rx) = ErrorRing::new(64);
 
-    #[cfg(any(test, feature = "test-util"))]
     let err_inject_tx_handle = Arc::new(std::sync::Mutex::new(inject_err_tx));
-    #[cfg(not(any(test, feature = "test-util")))]
-    {
-        // In production we don't expose injection; drop the producer immediately so any
-        // accidental future code path that tries to push gets a Result<_, _> error rather
-        // than a hidden no-op. The consumer stays alive on the engine; pop() returns
-        // Err(Empty) forever, which is fine.
-        drop(inject_err_tx);
-    }
 
     let engine = Engine {
         cmd_rx,
@@ -545,7 +537,6 @@ pub fn spawn(
         evt_rx,
         hot,
         tele,
-        #[cfg(any(test, feature = "test-util"))]
         err_inject_tx: err_inject_tx_handle,
     }
 }
