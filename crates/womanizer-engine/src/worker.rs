@@ -230,9 +230,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;
-    use womanizer_core::{
-        InputRing, MonitorOutRing, RING_CAPACITY, VirtualOutRing,
-    };
+    use womanizer_core::{InputRing, MonitorOutRing, VirtualOutRing, RING_CAPACITY};
 
     /// End-to-end: push a BLOCK-sized frame into in_tx, bump samples_since_wake, sleep, and
     /// assert the worker drained in_rx, ran memcpy, and pushed to vo_tx. Monitor disabled →
@@ -319,15 +317,12 @@ mod tests {
         let worker_thread = thread_rx.recv().unwrap();
         let wake = DspWakeHandle::new(worker_thread);
 
-        let pump_handle =
-            spawn_capture_pump(samples_since_wake.clone(), wake, stop_flag.clone())
-                .expect("spawn_capture_pump");
+        let pump_handle = spawn_capture_pump(samples_since_wake.clone(), wake, stop_flag.clone())
+            .expect("spawn_capture_pump");
 
         // --- Drive a single BLOCK-sized frame through the topology ---
         let frame = [0.5f32; BLOCK];
-        in_tx
-            .push_entire_slice(&frame)
-            .expect("push_entire_slice");
+        in_tx.push_entire_slice(&frame).expect("push_entire_slice");
         samples_since_wake.fetch_add(BLOCK, Ordering::Release);
 
         // Generous: the pump polls at 500 µs cadence, so 50 ms gives ~100 chances.

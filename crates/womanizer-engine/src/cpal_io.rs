@@ -41,7 +41,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use assert_no_alloc::assert_no_alloc;
-use atomic_float::AtomicF32;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     BufferSize, SampleFormat, SampleRate, StreamConfig, StreamInstant, SupportedBufferSize,
@@ -51,9 +50,7 @@ use cpal::{
 // type, not constructed via `SampleRate(48_000)`.
 use rtrb::Producer;
 use thiserror::Error;
-use womanizer_core::{
-    AudioFrame, DspWakeHandle, EngineError, HotParams, Telemetry,
-};
+use womanizer_core::{AudioFrame, DspWakeHandle, EngineError, HotParams, Telemetry};
 
 /// Phase 1 cpal block size — 256 frames at 48 kHz = 5.33 ms per cpal callback (D-03 baseline).
 /// Leaves headroom for Phase 2 DSP and Phase 3 shaping under the < 50 ms typical target.
@@ -153,9 +150,7 @@ pub type TimestampPair = (u64, StreamInstant);
 ///
 /// AUDIO-02 + AUDIO-05: refuses to silently fall back. If no config matches, returns
 /// `EngineBuildError::NoCompatibleConfig` so the UI can render the device row as red.
-pub fn pick_input_config(
-    device: &cpal::Device,
-) -> Result<SupportedStreamConfig, EngineBuildError> {
+pub fn pick_input_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineBuildError> {
     let target: SampleRate = SAMPLE_RATE_HZ;
     let supported = device
         .supported_input_configs()?
@@ -643,10 +638,13 @@ mod tests {
             SampleFormat::F32,
         );
         match assert_collapsed_config(&wrong_channels, INPUT_CHANNELS) {
-            Err(EngineBuildError::NegotiatedWrongChannels { got: 2, expected: 1 }) => {}
-            other => panic!(
-                "expected NegotiatedWrongChannels {{ got: 2, expected: 1 }}, got {other:?}"
-            ),
+            Err(EngineBuildError::NegotiatedWrongChannels {
+                got: 2,
+                expected: 1,
+            }) => {}
+            other => {
+                panic!("expected NegotiatedWrongChannels {{ got: 2, expected: 1 }}, got {other:?}")
+            }
         }
 
         // Wrong sample format (I16 instead of F32).
@@ -657,10 +655,10 @@ mod tests {
             SampleFormat::I16,
         );
         match assert_collapsed_config(&wrong_format, INPUT_CHANNELS) {
-            Err(EngineBuildError::NegotiatedWrongFormat { got: SampleFormat::I16 }) => {}
-            other => panic!(
-                "expected NegotiatedWrongFormat {{ got: I16 }}, got {other:?}"
-            ),
+            Err(EngineBuildError::NegotiatedWrongFormat {
+                got: SampleFormat::I16,
+            }) => {}
+            other => panic!("expected NegotiatedWrongFormat {{ got: I16 }}, got {other:?}"),
         }
 
         // Positive control: a fully compliant config passes.
@@ -676,9 +674,3 @@ mod tests {
         );
     }
 }
-
-// Unused import suppression — `AtomicF32` is re-exported from `atomic_float` and not used
-// directly in this module body (Telemetry/HotParams own their own atomics). Keep the import
-// path so a future revision that adds a local atomic does not need to re-discover the crate.
-#[allow(dead_code)]
-type _AtomicF32Alias = AtomicF32;
