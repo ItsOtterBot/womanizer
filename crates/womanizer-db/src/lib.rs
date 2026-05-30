@@ -10,6 +10,13 @@
 //! Phase 4 wires egui CRUD onto these tables; the engine reads voice params via the published
 //! snapshot and never touches SQLite on the audio thread.
 //!
+//! ## Public read surface
+//! - [`open_and_init`]: production entrypoint (canonical path, migrate, seed Default).
+//! - [`open_at`] / [`init_conn`]: test seams for an explicit path / pre-opened connection.
+//! - [`read_setting`]: read-only access to the key/value `settings` table (D-05); Phase 1's
+//!   contract is read-only — writes land in Phase 4 (see [`settings`] module docs for the
+//!   three Phase 1 keys).
+//!
 //! ## Path resolution and the test seam
 //!
 //! [`open_and_init`] takes NO user-supplied path — the DB location is resolved entirely by the
@@ -25,8 +32,10 @@ use rusqlite::Connection;
 
 pub mod schema;
 pub mod seed;
+pub mod settings;
 
 pub use seed::seed_default_if_empty;
+pub use settings::read_setting;
 
 /// SQLite database filename under the resolved app-data directory.
 /// `.sqlite3` makes the format obvious to anyone inspecting the app-data folder.
