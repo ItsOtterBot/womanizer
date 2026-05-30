@@ -30,3 +30,8 @@ pub mod worker;
 // concrete `detect()` function is cfg-gated and exported from the per-OS module by
 // `devices/mod.rs`; the signature is finalized in Plan 01-04.
 pub use devices::{detect, DetectionResult};
+
+// Re-export the engine handle types so the UI (Plan 01-05) can
+// `use womanizer_engine::{EngineHandle, EngineState, spawn}` without reaching into the
+// `event_loop` module. Populated by Plan 01-02b.
+pub use event_loop::{spawn as spawn_engine, EngineHandle, EngineState};
