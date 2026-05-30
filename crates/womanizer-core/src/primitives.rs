@@ -39,6 +39,12 @@ pub struct HotParams {
     pub gate_threshold: AtomicF32,
     /// Bypass the whole effect chain (pass audio through unprocessed).
     pub bypass: AtomicBool,
+    /// Self-monitor playback gate. Default false (D-12 — monitor ships OFF). Set to false by
+    /// the engine event loop's feedback-loop detector on trip (D-14, AUDIO-08); the UI toggle
+    /// re-sets it to true. Overwrite-latest semantics — atomic, never `Mutex`. Added by Phase 1
+    /// Plan 01-01 as a cross-phase contract widening (Pattern G — fields that cross thread
+    /// boundaries live in `womanizer-core/src/primitives.rs`).
+    pub monitor_enabled: AtomicBool,
 }
 
 /// Live engine telemetry, shared as `Arc<Telemetry>`. Written by the engine, read by the UI

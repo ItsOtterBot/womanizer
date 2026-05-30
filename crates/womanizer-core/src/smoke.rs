@@ -71,6 +71,10 @@ pub fn run_smoke_test() -> anyhow::Result<()> {
         input_gain: atomic_float::AtomicF32::new(1.0),
         gate_threshold: atomic_float::AtomicF32::new(0.0),
         bypass: std::sync::atomic::AtomicBool::new(false),
+        // D-12: self-monitor defaults OFF. The smoke harness exercises `bypass` as the
+        // representative HotParams round-trip; the real `monitor_enabled` round-trip lands
+        // in Plan 01-03 monitor.rs tests.
+        monitor_enabled: std::sync::atomic::AtomicBool::new(false),
     });
     let tele = Arc::new(Telemetry {
         latency_ms: atomic_float::AtomicF32::new(0.0),
