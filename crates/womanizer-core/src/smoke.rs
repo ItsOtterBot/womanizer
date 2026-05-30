@@ -7,9 +7,16 @@
 //!
 //! Written as a standalone `pub fn` so a later phase can promote it to a `--selftest` binary
 //! mode without rework (D-12; the subcommand itself is deferred). The `stub_dsp_callback` is
-//! written *as if* it ran on the RT thread (no allocation, no lock, no channel, no log) and is
-//! wrapped in [`assert_no_alloc`](assert_no_alloc::assert_no_alloc) so the RT-safe contract is
-//! exercised from day one.
+//! written *as if* it ran on the RT thread (no allocation, no lock, no channel, no log) and
+//! is wrapped in [`assert_no_alloc`](assert_no_alloc::assert_no_alloc).
+//!
+//! The harness ENFORCES the no-allocation contract: it snapshots
+//! [`assert_no_alloc::violation_count`] before the RT-shaped region and fails loudly if the
+//! counter increased after. The workspace builds `assert_no_alloc` with the `warn_debug`
+//! feature, which makes a violation warn-and-continue rather than panic — so the explicit
+//! before/after delta is what turns detection into a hard failure. The before snapshot
+//! (rather than a reset) also keeps the result robust against unrelated prior violations
+//! that may sit in the process-global counter when the harness is invoked from a test.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -92,7 +99,18 @@ pub fn run_smoke_test() -> anyhow::Result<()> {
         chunk.commit_all();
     }
     let mut processed = [0f32; SMOKE_BLOCK];
+    // Snapshot the assert_no_alloc violation counter BEFORE the RT-shaped region. The counter
+    // is process-global, so comparing the delta (rather than resetting) keeps the harness
+    // robust against unrelated prior violations recorded by other tests in the same process.
+    // After the region, if the counter advanced, the stub allocated inside an RT-forbidden
+    // path — that is a hard failure for this harness even under the `warn_debug` feature.
+    let no_alloc_before = assert_no_alloc::violation_count();
     stub_dsp_callback(&scratch, &mut processed);
+    if assert_no_alloc::violation_count() > no_alloc_before {
+        anyhow::bail!(
+            "stub DSP allocated inside an RT-forbidden region (violation counter advanced)"
+        );
+    }
 
     vo_tx
         .push_entire_slice(&processed)
