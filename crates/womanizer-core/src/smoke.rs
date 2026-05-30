@@ -10,13 +10,18 @@
 //! written *as if* it ran on the RT thread (no allocation, no lock, no channel, no log) and
 //! is wrapped in [`assert_no_alloc`](assert_no_alloc::assert_no_alloc).
 //!
-//! The harness ENFORCES the no-allocation contract: it snapshots
+//! In debug builds the harness ENFORCES the no-allocation contract: it snapshots
 //! [`assert_no_alloc::violation_count`] before the RT-shaped region and fails loudly if the
 //! counter increased after. The workspace builds `assert_no_alloc` with the `warn_debug`
 //! feature, which makes a violation warn-and-continue rather than panic — so the explicit
 //! before/after delta is what turns detection into a hard failure. The before snapshot
 //! (rather than a reset) also keeps the result robust against unrelated prior violations
 //! that may sit in the process-global counter when the harness is invoked from a test.
+//!
+//! In release builds the no-alloc enforcement is intentionally compiled out — `warn_debug`
+//! does not activate `violation_count` in release, and `AllocDisabler` is only registered as
+//! the `#[global_allocator]` under `#[cfg(debug_assertions)]`. The harness still shuttles
+//! every primitive end-to-end in release; it just cannot verify the no-alloc contract there.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -103,9 +108,17 @@ pub fn run_smoke_test() -> anyhow::Result<()> {
     // is process-global, so comparing the delta (rather than resetting) keeps the harness
     // robust against unrelated prior violations recorded by other tests in the same process.
     // After the region, if the counter advanced, the stub allocated inside an RT-forbidden
-    // path — that is a hard failure for this harness even under the `warn_debug` feature.
+    // path — that is a hard failure for this harness.
+    //
+    // The check is gated on `debug_assertions` because `assert_no_alloc`'s `warn_debug`
+    // feature only compiles `violation_count()` in debug builds (and `AllocDisabler` is
+    // only registered as the `#[global_allocator]` in debug — see app/main.rs). In release
+    // builds the no-alloc enforcement is intentionally compiled out, so the harness still
+    // shuttles primitives end-to-end but cannot verify the no-alloc contract.
+    #[cfg(debug_assertions)]
     let no_alloc_before = assert_no_alloc::violation_count();
     stub_dsp_callback(&scratch, &mut processed);
+    #[cfg(debug_assertions)]
     if assert_no_alloc::violation_count() > no_alloc_before {
         anyhow::bail!(
             "stub DSP allocated inside an RT-forbidden region (violation counter advanced)"
