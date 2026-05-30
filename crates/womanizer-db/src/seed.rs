@@ -8,6 +8,11 @@
 //!   - first launch (empty `voices`) → exactly one Default row is inserted;
 //!   - any later launch with ≥1 voice → no-op (idempotent, never duplicates).
 //!
+//! Defense in depth: the `voices_name_uniq` UNIQUE INDEX (migration 2) enforces single-row
+//! "Default" at the storage layer, and this function uses `INSERT OR IGNORE` so a concurrent
+//! or repeat insert is a silent no-op rather than a constraint error. The COUNT guard remains
+//! as a fast-path skip; the schema constraint is the authoritative invariant.
+//!
 //! The seed values come from [`womanizer_core::VoiceParams::default()`] — the single source of
 //! truth for the D-07 starting point — so the DB seed can never drift from the in-memory
 //! contract. The INSERT is PARAMETERIZED (`?N` placeholders, never string-concatenated SQL)
@@ -31,15 +36,21 @@ fn quality_preset_str(preset: &QualityPreset) -> &'static str {
 
 /// Seed exactly one "Default" voice if the `voices` table is empty; otherwise do nothing.
 ///
-/// Idempotent: safe to call on every open. Uses a parameterized INSERT (`?N`) — there is no
-/// string-concatenated SQL anywhere in this crate (T-00-05). The row's values are taken from
-/// [`VoiceParams::default()`] (the D-07 contract).
+/// Idempotent at two layers:
+///   1. Fast path: the `COUNT(*) == 0` guard skips the INSERT entirely on later launches.
+///   2. Authoritative guard: `INSERT OR IGNORE` plus the `voices_name_uniq` UNIQUE INDEX
+///      means a racing or repeat insert of a row named "Default" is a silent no-op rather
+///      than a constraint error. Safe to call on every open.
+///
+/// Uses a parameterized INSERT (`?N`) — there is no string-concatenated SQL anywhere in this
+/// crate (T-00-05). The row's values are taken from [`VoiceParams::default()`] (the D-07
+/// contract).
 pub fn seed_default_if_empty(conn: &Connection) -> Result<()> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM voices", [], |row| row.get(0))?;
     if count == 0 {
         let p = VoiceParams::default();
         conn.execute(
-            "INSERT INTO voices
+            "INSERT OR IGNORE INTO voices
                  (name, pitch_semitones, formant_semitones, compensate_pitch,
                   breathiness, brightness_db, sibilance_tame, mix, quality_preset, color_tag)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",

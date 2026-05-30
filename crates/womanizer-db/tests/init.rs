@@ -142,3 +142,93 @@ fn in_memory_init_is_idempotent() {
         "in-memory seed must be idempotent"
     );
 }
+
+/// Schema-level uniqueness on `voices.name` is enforced by the `voices_name_uniq` UNIQUE
+/// INDEX. Proves two complementary behaviors:
+///   - `INSERT OR IGNORE` against a duplicate name is a silent no-op (rows_affected == 0).
+///   - A plain `INSERT INTO voices(name, ...)` with the same name fails with a SQLite
+///     constraint violation.
+///
+/// Together they prove the index is live and that `seed_default_if_empty`'s `INSERT OR
+/// IGNORE` is the right pairing for the schema invariant.
+#[test]
+fn duplicate_voice_name_is_rejected_by_unique_index() {
+    let mut conn = Connection::open_in_memory().expect("in-memory connection");
+    womanizer_db::init_conn(&mut conn).expect("init_conn should migrate + seed");
+    assert_eq!(
+        default_voice_count(&conn),
+        1,
+        "init must seed exactly one Default"
+    );
+
+    // (1) INSERT OR IGNORE with a duplicate name must be a silent no-op.
+    let or_ignore_rows = conn
+        .execute(
+            "INSERT OR IGNORE INTO voices
+                 (name, pitch_semitones, formant_semitones, compensate_pitch,
+                  breathiness, brightness_db, sibilance_tame, mix, quality_preset, color_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "Default",
+                0.0_f64,
+                0.0_f64,
+                0_i64,
+                0.0_f64,
+                0.0_f64,
+                0.0_f64,
+                1.0_f64,
+                "Balanced",
+                Option::<String>::None,
+            ],
+        )
+        .expect("INSERT OR IGNORE should not return an error on a duplicate-name conflict");
+    assert_eq!(
+        or_ignore_rows, 0,
+        "INSERT OR IGNORE with a duplicate name must affect zero rows"
+    );
+    assert_eq!(
+        default_voice_count(&conn),
+        1,
+        "INSERT OR IGNORE must not actually insert when the UNIQUE INDEX would be violated"
+    );
+
+    // (2) A plain INSERT with the same name must fail with a constraint violation.
+    let plain_err = conn
+        .execute(
+            "INSERT INTO voices
+                 (name, pitch_semitones, formant_semitones, compensate_pitch,
+                  breathiness, brightness_db, sibilance_tame, mix, quality_preset, color_tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "Default",
+                0.0_f64,
+                0.0_f64,
+                0_i64,
+                0.0_f64,
+                0.0_f64,
+                0.0_f64,
+                1.0_f64,
+                "Balanced",
+                Option::<String>::None,
+            ],
+        )
+        .expect_err("plain INSERT with a duplicate name must fail under the UNIQUE INDEX");
+
+    match plain_err {
+        rusqlite::Error::SqliteFailure(err, _) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "duplicate-name INSERT must fail with a SQLite constraint violation, got {err:?}"
+            );
+        }
+        other => panic!("expected SqliteFailure(ConstraintViolation), got {other:?}"),
+    }
+
+    // The row count is still 1 — the failed INSERT did not somehow leak a row.
+    assert_eq!(
+        default_voice_count(&conn),
+        1,
+        "a rejected duplicate INSERT must not change the row count"
+    );
+}

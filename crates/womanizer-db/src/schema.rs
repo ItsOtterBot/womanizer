@@ -23,27 +23,34 @@ use rusqlite_migration::{Migrations, M};
 /// `user_version` advanced by `rusqlite_migration` after a successful, atomic apply.
 ///
 /// Migration 1 creates the `voices` (typed) and `settings` (key/value) tables (D-05).
-pub const MIGRATIONS_SLICE: &[M<'_>] = &[M::up(
-    "CREATE TABLE voices (
-        id                INTEGER PRIMARY KEY,
-        name              TEXT NOT NULL,
-        pitch_semitones   REAL NOT NULL,
-        formant_semitones REAL NOT NULL,
-        compensate_pitch  INTEGER NOT NULL,   -- 0/1 (SQLite has no native bool)
-        breathiness       REAL NOT NULL,
-        brightness_db     REAL NOT NULL,
-        sibilance_tame    REAL NOT NULL,
-        mix               REAL NOT NULL,
-        quality_preset    TEXT NOT NULL,
-        color_tag         TEXT,               -- nullable: optional UI color tag
-        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE settings (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL                    -- structured values are JSON-in-value (D-05)
-    );",
-)];
+/// Migration 2 enforces uniqueness on `voices.name` via a UNIQUE INDEX (a SQLite-friendly way
+/// to add the constraint without rebuilding the table on existing databases). This makes the
+/// seed's "exactly one Default" invariant schema-enforced rather than relying solely on the
+/// single-threaded call-site discipline of `seed_default_if_empty`.
+pub const MIGRATIONS_SLICE: &[M<'_>] = &[
+    M::up(
+        "CREATE TABLE voices (
+            id                INTEGER PRIMARY KEY,
+            name              TEXT NOT NULL,
+            pitch_semitones   REAL NOT NULL,
+            formant_semitones REAL NOT NULL,
+            compensate_pitch  INTEGER NOT NULL,   -- 0/1 (SQLite has no native bool)
+            breathiness       REAL NOT NULL,
+            brightness_db     REAL NOT NULL,
+            sibilance_tame    REAL NOT NULL,
+            mix               REAL NOT NULL,
+            quality_preset    TEXT NOT NULL,
+            color_tag         TEXT,               -- nullable: optional UI color tag
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL                    -- structured values are JSON-in-value (D-05)
+        );",
+    ),
+    M::up("CREATE UNIQUE INDEX IF NOT EXISTS voices_name_uniq ON voices(name);"),
+];
 
 /// The schema's migration set. `MIGRATIONS.to_latest(&mut conn)` applies all pending
 /// migrations and advances `user_version` (D-06).
