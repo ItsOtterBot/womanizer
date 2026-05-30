@@ -26,8 +26,15 @@ static A: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 /// A heap allocation inside a forbidden region must trip the guardrail. The guard increments
 /// the violation counter (warn_debug); we observe that and panic so `#[should_panic]` passes.
+///
+/// Both tests in this binary read and reset the process-global `assert_no_alloc` violation
+/// counter. Cargo runs `#[test]`s in a binary on parallel threads by default — a reset in
+/// one test can race the before/after snapshot in the other. The `serial_test` group name
+/// serializes them against each other (and any future tests that touch the same counter)
+/// without serializing unrelated tests.
 #[cfg(debug_assertions)]
 #[test]
+#[serial_test::serial(no_alloc_violation_counter)]
 #[should_panic(expected = "assert_no_alloc guard detected a forbidden allocation")]
 fn no_alloc_guard_catches_violation() {
     assert_no_alloc::reset_violation_count();
@@ -53,8 +60,11 @@ fn no_alloc_guard_catches_violation() {
 }
 
 /// Positive control: a copy-only region inside `assert_no_alloc` must NOT trip the guard.
+/// Serialized against `no_alloc_guard_catches_violation` via the shared `serial_test` group
+/// so a reset / intentional allocation in the other test cannot race this snapshot window.
 #[cfg(debug_assertions)]
 #[test]
+#[serial_test::serial(no_alloc_violation_counter)]
 fn no_alloc_guard_allows_copy_only_region() {
     assert_no_alloc::reset_violation_count();
     let before = assert_no_alloc::violation_count();

@@ -21,3 +21,11 @@ thiserror = { workspace = true }
 # [workspace.dependencies]. thiserror remains the library error idiom; anyhow is used here
 # for the harness's aggregate "any primitive failed to shuttle" result.
 anyhow = { workspace = true }
+
+# serial_test is used ONLY by this crate's no_alloc integration tests, which share the
+# process-global assert_no_alloc violation counter. Cargo runs #[test]s in a binary in
+# parallel by default; without serialization, a reset in one test can race the
+# before/after snapshot in the other and flake. Pinned here (not in workspace.dependencies)
+# because it has no other consumer in the workspace.
+[dev-dependencies]
+serial_test = "3"
