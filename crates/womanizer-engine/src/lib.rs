@@ -35,3 +35,19 @@ pub use devices::{detect, DetectionResult};
 // `use womanizer_engine::{EngineHandle, EngineState, spawn}` without reaching into the
 // `event_loop` module. Populated by Plan 01-02b.
 pub use event_loop::{spawn as spawn_engine, EngineHandle, EngineState};
+
+// Re-export the cpal-side UI surface: device enumeration for the Ready shell's input row
+// (AUDIO-01), the BLOCK / SAMPLE_RATE_HZ engine constants for any UI surface that needs them.
+pub use cpal_io::{enumerate_inputs, BLOCK, SAMPLE_RATE_HZ};
+
+// Re-export the banner-state publishers and verbatim copy constants that Plan 01-05's
+// Ready shell consumes for the three yellow banners (AUDIO-04 sample-rate-mismatch,
+// AUDIO-08 feedback-detected, AUDIO-09 disconnected).
+pub use monitor::{MonitorBannerState, DISCONNECT_BANNER_COPY, FEEDBACK_BANNER_COPY};
+pub use resampler::{SampleRateState, RESAMPLE_BANNER_TEMPLATE};
+
+// Re-export the off-audio-thread command/event types womanizer-core publishes so the UI can
+// `use womanizer_engine::{EngineCommand, EngineEvent}` without depending on womanizer-core
+// directly. (The app crate still depends on womanizer-core for HotParams / Telemetry / etc.,
+// but reducing the surface the UI imports for the channel types is a small ergonomic win.)
+pub use womanizer_core::{EngineCommand, EngineError, EngineEvent};

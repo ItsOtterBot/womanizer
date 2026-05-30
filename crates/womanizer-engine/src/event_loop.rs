@@ -48,6 +48,7 @@ use crate::cpal_io::{
     self, build_capture_stream, build_virtual_output_stream, EngineStreams, TimestampPair,
     TS_RING_CAPACITY,
 };
+use crate::monitor::{FeedbackDetector, MonitorBannerState};
 use crate::worker::{self, WorkerHandles};
 
 /// 50 ms event-loop tick — the cadence at which the engine drains the `ErrorRing` and (in
@@ -90,6 +91,14 @@ pub struct EngineHandle {
     pub hot: Arc<HotParams>,
     /// Shared live telemetry (latency, RMS, xrun count).
     pub tele: Arc<Telemetry>,
+    /// Shared banner-state atomics (feedback_detected + disconnected). Plan 01-05's UI
+    /// repaint loop reads `is_feedback_detected()` / `is_disconnected()` each frame to render
+    /// the AUDIO-08 / D-14 + AUDIO-09 / D-07 yellow banners. The engine's `FeedbackDetector`
+    /// (instantiated inside `Engine::build_streams_and_worker` per W8 wiring) writes
+    /// `feedback_detected = true` on trip; the event loop sets `disconnected = true` when it
+    /// drains an `EngineError::DeviceFault` from the ErrorRing. Cloned via inner Arcs so UI
+    /// and engine see the same atomics.
+    pub monitor_banner: MonitorBannerState,
     /// ErrorRing producer the engine drains on every 50 ms tick alongside the per-Start
     /// capture / virtual-output rings. The principal consumer is the integration test in
     /// `tests/reconnect.rs` (AUDIO-09 ground truth — synthesize a `DeviceFault` without a
@@ -129,6 +138,15 @@ struct Engine {
     hot: Arc<HotParams>,
     tele: Arc<Telemetry>,
 
+    // --- banner state shared with the UI (W8 wiring half) ---
+    //
+    // Engine writes `disconnected = true` when an `EngineError::DeviceFault` is drained from
+    // the ErrorRing and the UI's repaint loop reads `is_disconnected()` each frame; the
+    // FeedbackDetector inside the engine writes `feedback_detected = true` on trip. The same
+    // MonitorBannerState struct is cloned into `EngineHandle::monitor_banner` so both sides
+    // see the same Arc<AtomicBool> pair.
+    monitor_banner: MonitorBannerState,
+
     // --- in-memory device-name state preserved across reconnect (AUDIO-09 + D-21) ---
     state: EngineState,
 
@@ -152,6 +170,15 @@ struct Engine {
     // --- stream + worker lifetime (Some only when Started) ---
     streams: Option<EngineStreams>,
     worker: Option<WorkerHandles>,
+
+    // --- feedback detector (Some only when Started — W8 wiring) ---
+    //
+    // Constructed inside `build_streams_and_worker` once `tele` / `hot` / `monitor_banner`
+    // are live; ticked from the Timeout arm at the 50 ms `recv_timeout` cadence; dropped in
+    // `handle_stop_silent` alongside the streams + worker handles. The detector observes
+    // `Telemetry::input_rms` (written by the cpal capture callback) and on trip clears
+    // `HotParams::monitor_enabled` + sets `monitor_banner.feedback_detected = true` (D-14).
+    feedback_detector: Option<FeedbackDetector>,
 }
 
 impl Engine {
@@ -171,11 +198,18 @@ impl Engine {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.drain_error_ring();
-                    // Plan 01-05 (Wave 4) wires self.feedback_detector.tick() here; see W8.
-                    // The detector struct itself lives in monitor.rs (already shipped by
-                    // Plan 01-03); Plan 01-05 owns the instantiation + this tick call (the
-                    // banner state is cloned into the egui App so the UI repaints react to
-                    // a trip — see Plan 01-03 SUMMARY "Next Phase Readiness").
+                    // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms
+                    // cadence as the ErrorRing drain. The detector is only present while
+                    // streams are Started (built in `build_streams_and_worker`, dropped in
+                    // `handle_stop_silent`), so the `if let` keeps the Stopped path a no-op.
+                    // The detector observes `Telemetry::input_rms` (written by the cpal
+                    // capture callback) — when 5 consecutive 50 ms RMS windows each rise by
+                    // ≥ 6 dB, it stores `monitor_enabled = false` (D-14) and sets
+                    // `monitor_banner.feedback_detected = true` so the UI repaints the
+                    // yellow banner (D-13 + AUDIO-08 500 ms total budget).
+                    if let Some(fd) = self.feedback_detector.as_mut() {
+                        fd.tick();
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     tracing::info!("engine cmd channel disconnected; event loop exiting");
@@ -363,6 +397,25 @@ impl Engine {
         )
         .map_err(EngineBootError::BuildVirtualOut)?;
 
+        // ---- W8 wiring: instantiate the FeedbackDetector now that tele / hot / banner
+        // are live and the streams that drive `Telemetry::input_rms` are about to run. ----
+        //
+        // The detector ticks at the same 50 ms cadence as the ErrorRing drain (from the
+        // Timeout arm); on a 5×6 dB trip it clears `HotParams::monitor_enabled` and sets
+        // `monitor_banner.feedback_detected` so the UI's repaint loop renders the yellow
+        // banner. The MonitorBannerState is shared with the EngineHandle (cloned via inner
+        // Arc<AtomicBool> pair) so UI + engine see the same atomics.
+        let feedback_detector = FeedbackDetector::new(
+            self.tele.clone(),
+            self.hot.clone(),
+            self.monitor_banner.clone(),
+        );
+
+        // ---- W8 wiring: a fresh Start clears any leftover disconnect banner from the
+        // previous session. The UI's "click to reconnect" handler sends Start, the engine
+        // rebuilds streams successfully, the banner clears. ----
+        self.monitor_banner.clear_disconnected();
+
         // ---- stash on self for the duration of the Started state ----
         self.streams = Some(EngineStreams {
             input: input_stream,
@@ -371,6 +424,7 @@ impl Engine {
         self.worker = Some(worker);
         self.capture_err_rx = Some(capture_err_rx);
         self.vout_err_rx = Some(vout_err_rx);
+        self.feedback_detector = Some(feedback_detector);
         Ok(())
     }
 
@@ -408,6 +462,13 @@ impl Engine {
         // cpal closures and are dropped with the streams above.
         self.capture_err_rx = None;
         self.vout_err_rx = None;
+
+        // Drop the per-Start FeedbackDetector — its Arc<Telemetry> / Arc<HotParams> /
+        // MonitorBannerState clones are held only by the detector and the EngineHandle, so
+        // letting it drop here releases this engine's hold on them. The banner state itself
+        // is NOT cleared here: a sticky disconnect banner survives Stop so the UI can show
+        // it after a teardown caused by a DeviceFault.
+        self.feedback_detector = None;
     }
 
     /// Drain ALL error-ring consumers (injection + capture + virtual-output) into
@@ -415,23 +476,38 @@ impl Engine {
     /// cadence). Pattern: `let _ = self.evt_tx.send(...)` — the UI may have already dropped
     /// the receiver (window closed); the next iteration's `Disconnected` arm handles
     /// graceful shutdown.
+    ///
+    /// W8 wiring side-effect: a drained `EngineError::DeviceFault` ALSO sets the
+    /// `MonitorBannerState::disconnected` flag so the UI's repaint loop renders the AUDIO-09
+    /// / D-07 yellow banner without waiting to observe the `EngineEvent` arrival. Both paths
+    /// (the event-channel emission AND the banner flag) are in place — the UI is free to
+    /// listen on either; the banner-flag path is the simpler 30-Hz repaint check.
     fn drain_error_ring(&mut self) {
         while let Ok(e) = self.inject_err_rx.pop() {
             tracing::warn!(
                 ?e,
                 "engine error drained from injection ErrorRing (test path)"
             );
+            if matches!(e, EngineError::DeviceFault) {
+                self.monitor_banner.set_disconnected();
+            }
             let _ = self.evt_tx.send(EngineEvent::Error(e));
         }
         if let Some(rx) = self.capture_err_rx.as_mut() {
             while let Ok(e) = rx.pop() {
                 tracing::warn!(?e, "engine error drained from capture ErrorRing");
+                if matches!(e, EngineError::DeviceFault) {
+                    self.monitor_banner.set_disconnected();
+                }
                 let _ = self.evt_tx.send(EngineEvent::Error(e));
             }
         }
         if let Some(rx) = self.vout_err_rx.as_mut() {
             while let Ok(e) = rx.pop() {
                 tracing::warn!(?e, "engine error drained from virtual-output ErrorRing");
+                if matches!(e, EngineError::DeviceFault) {
+                    self.monitor_banner.set_disconnected();
+                }
                 let _ = self.evt_tx.send(EngineEvent::Error(e));
             }
         }
@@ -510,17 +586,28 @@ pub fn spawn(
 
     let err_inject_tx_handle = Arc::new(std::sync::Mutex::new(inject_err_tx));
 
+    // W8 wiring: construct a single MonitorBannerState that both the engine (writes
+    // disconnected/feedback_detected on trip) and the UI (reads them each repaint to render
+    // the yellow banners) share. Cloned via inner Arc<AtomicBool> — both holders see the
+    // same atomics. The shared state is created HERE (not in build_streams_and_worker) so
+    // the disconnect banner can be set on the very first DeviceFault even if streams have
+    // not yet been built (e.g. when default_input_device() returns None on a headless box —
+    // build fails, error event emits, banner reflects the disconnected state immediately).
+    let monitor_banner = MonitorBannerState::new();
+
     let engine = Engine {
         cmd_rx,
         evt_tx,
         hot: hot.clone(),
         tele: tele.clone(),
+        monitor_banner: monitor_banner.clone(),
         state: initial_state,
         inject_err_rx,
         capture_err_rx: None,
         vout_err_rx: None,
         streams: None,
         worker: None,
+        feedback_detector: None,
     };
 
     // Spawn the engine event-loop thread. We do not retain the JoinHandle — the engine
@@ -537,6 +624,7 @@ pub fn spawn(
         evt_rx,
         hot,
         tele,
+        monitor_banner,
         err_inject_tx: err_inject_tx_handle,
     }
 }

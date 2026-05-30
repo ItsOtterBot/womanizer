@@ -9,10 +9,20 @@
 //!   3. if `--smoke` was passed, runs the reusable cross-thread plumbing smoke harness and
 //!      exits — the database is NOT touched, so the harness can verify plumbing even if the
 //!      user's app-data directory is unwritable or the SQLite file is corrupt,
-//!   4. otherwise opens/migrates/seeds the local voice database.
+//!   4. otherwise opens/migrates/seeds the local voice database, reads the three Phase 1
+//!      last-selected device-id settings (`input_device_id`, `virtual_output_device_id`,
+//!      `monitor_device_id` — read-only per Phase 1's contract; writes land in Phase 4),
+//!      constructs the eframe App in the Setup state with those slots populated, and runs
+//!      `eframe::run_native` to open the window.
 //!
-//! No real audio engine or UI surface exists yet — normal launch opens the database and exits
-//! cleanly. The window and engine are wired in later phases.
+//! `eframe::run_native` returns when the user closes the window or `egui::ViewportCommand::Close`
+//! is sent (e.g. the setup screen's Quit button). On headless CI hosts (no display server),
+//! `run_native` returns `Err(eframe::Error)` immediately; `main()` propagates that as
+//! `anyhow::Error` rather than panicking.
+
+// The App state machine + render modules live in the lib half of this crate so they can be
+// unit-tested via `cargo test -p womanizer-app --lib`. The bin imports the public surface.
+use womanizer_app::app;
 
 // Register the no-allocation guard as the global allocator in debug builds ONLY.
 //
@@ -41,6 +51,10 @@ fn main() -> anyhow::Result<()> {
     // primitives — it must run even if the user's app-data directory is unwritable or the
     // SQLite database is corrupt or locked. Branch on `--smoke` BEFORE opening the database so a
     // field triage of the plumbing is never coupled to the health of the on-disk DB.
+    //
+    // Plan 01-05 contract (CONTEXT integration-points): the --smoke branch must remain unchanged
+    // and must NOT initialize the engine or eframe. This is verified by the plan's verify-block
+    // running `cargo run -p womanizer-app -- --smoke` and grep'ing for "smoke harness passed".
     if std::env::args().any(|arg| arg == "--smoke") {
         tracing::info!("running cross-thread plumbing smoke harness");
         womanizer_core::smoke::run_smoke_test()?;
@@ -58,8 +72,58 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "<in-memory>".to_string());
     tracing::info!(db_path = %db_path, "voice database opened, migrated, and seeded");
 
-    // The database is ready. The real-time engine and the GUI window land in later phases — for
-    // now the binary exits cleanly so it is safe to run on headless hosts.
-    tracing::info!("startup complete; no engine or UI in this build — exiting");
+    // ---- Phase 1 (Plan 01-05): read the three last-selected device-id settings ----
+    //
+    // Phase 1 is READ-ONLY per CONTEXT integration-points. Each read is `Ok(None)` for a
+    // fresh install (the settings table is empty); on subsequent launches Phase 4 will have
+    // written the user's last selection. Any error reading the settings table is logged + the
+    // slot defaults to None (the engine will fall back to host defaults — same as a fresh
+    // install).
+    let last_input = womanizer_db::read_setting(&conn, womanizer_db::settings::KEY_INPUT_DEVICE_ID)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "failed to read input_device_id from settings; using None");
+            None
+        });
+    let last_vout =
+        womanizer_db::read_setting(&conn, womanizer_db::settings::KEY_VIRTUAL_OUTPUT_DEVICE_ID)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = ?e,
+                    "failed to read virtual_output_device_id from settings; using None"
+                );
+                None
+            });
+    let last_mon = womanizer_db::read_setting(&conn, womanizer_db::settings::KEY_MONITOR_DEVICE_ID)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = ?e,
+                "failed to read monitor_device_id from settings; using None"
+            );
+            None
+        });
+    tracing::info!(
+        last_input = ?last_input,
+        last_vout = ?last_vout,
+        last_mon = ?last_mon,
+        "last-selected device ids read from settings (Phase 1 read-only)",
+    );
+
+    // ---- Construct the eframe App + launch the window ----
+    //
+    // The App starts in the Setup state with the three device-id slots populated. eframe owns
+    // the conn (we drop it explicitly here — the App does NOT hold the SQLite connection;
+    // Phase 4 will re-open the DB inside the egui app to wire CRUD).
+    drop(conn);
+
+    let app = app::App::new(last_input, last_vout, last_mon);
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Womanizer",
+        native_options,
+        Box::new(|_cc| Ok(Box::new(app))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {e}"))?;
+
+    tracing::info!("eframe window closed; exiting cleanly");
     Ok(())
 }

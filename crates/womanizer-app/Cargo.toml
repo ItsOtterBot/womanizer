@@ -6,6 +6,14 @@ edition = "2021"
 # metadata and lets `cargo-deny` skip license evaluation for first-party crates ([licenses] private).
 publish = false
 
+# Library half — exposes the egui App state machine + render modules so they can be
+# unit-tested via `cargo test -p womanizer-app --lib`. The bin uses this lib via
+# `use womanizer_app::app`. Both halves ship as one workspace member; the lib is not
+# published (publish = false above).
+[lib]
+name = "womanizer_app"
+path = "src/lib.rs"
+
 # The single shipped binary. The only crate where #[global_allocator] (assert_no_alloc) and
 # eframe live, so the library crates stay egui-free and unit-testable (D-01).
 [[bin]]
@@ -19,6 +27,11 @@ path = "src/main.rs"
 [dependencies]
 womanizer-core = { path = "../womanizer-core" }
 womanizer-db = { path = "../womanizer-db" }
+# Plan 01-05 (Wave 4): the eframe app constructs the engine via `womanizer_engine::spawn_engine`
+# (the public surface published by Plan 01-02b) and renders the setup-gate `Test detection`
+# button against `womanizer_engine::detect()` (Plan 01-04). The dependency is on the public
+# library surface only — the app never reaches into engine-internal modules.
+womanizer-engine = { path = "../womanizer-engine" }
 assert_no_alloc = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -27,3 +40,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 eframe = { workspace = true }
 egui = { workspace = true }
+# Used by app.rs to send EngineCommand on the EngineHandle's cmd_tx channel without
+# round-tripping through womanizer_engine for the bare channel type.
+crossbeam-channel = { workspace = true }
+# Needed to construct HotParams::input_gain / gate_threshold and Telemetry::latency_ms /
+# input_rms (the AtomicF32 wrappers womanizer-core uses; stable Rust still lacks them).
+atomic_float = { workspace = true }
