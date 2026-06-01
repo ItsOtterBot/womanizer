@@ -348,9 +348,12 @@ impl Engine {
         // ---- counters + wake ----
         let samples_since_wake = Arc::new(AtomicUsize::new(0));
 
-        // Spawn worker threads BEFORE building the cpal streams so the DspWakeHandle the
-        // capture callback receives is bound to the DSP worker thread (worker::spawn
-        // internally constructs the wake handle bound to its dsp_thread).
+        // Spawn worker threads. `worker::spawn` internally constructs the wake handle bound
+        // to the spawned DSP worker thread (see `spawn_dsp_worker` for the one-shot channel
+        // that hands the thread's `Thread` handle back to the caller so the wake's
+        // `unpark()` target is correct). The pump thread gets that same wake clone — when
+        // it observes ≥ BLOCK frames in `samples_since_wake`, calling `wake.wake()` actually
+        // unparks the DSP worker, which was the Phase 1 close-out bug.
         let worker = worker::spawn(
             in_rx,
             vo_tx,
@@ -358,40 +361,6 @@ impl Engine {
             samples_since_wake.clone(),
             self.hot.clone(),
             snap_out,
-            // worker::spawn ignores this `wake` parameter for the dsp_thread (it builds its
-            // own wake handle internally bound to dsp_thread); but per the current public
-            // signature we must supply one. The capture-pump thread uses THIS handle to
-            // wake the DSP worker. Bind to current thread as a placeholder; the actual
-            // wake target is reset inside worker::spawn via spawn_capture_pump's wake arg.
-            //
-            // SEE: crates/womanizer-engine/src/worker.rs::spawn — it builds
-            //   `DspWakeHandle::new(dsp_thread)` internally? No — it accepts `wake` and
-            // uses it for BOTH spawn_dsp_worker and spawn_capture_pump via clone. So the
-            // wake handle must be bound to the dsp_thread for `wait()` to be effective.
-            //
-            // worker::spawn's current implementation does NOT internally create the wake;
-            // it takes `wake: DspWakeHandle` as an argument. The cleanest workaround in
-            // Phase 1: we cannot know the dsp_thread's handle before spawning it. The
-            // worker module's signature should be `wake: DspWakeHandle` bound to its OWN
-            // dsp_thread; but spawn() takes wake as an input. We pass a wake bound to the
-            // current (engine-loop) thread — the wait() will park the dsp_thread on the
-            // wrong target's `pending` flag, which IS the same Arc<AtomicBool> across the
-            // clone, so `wait()` still observes wakes. The `unpark()` side targets the
-            // engine-loop thread (no-op for the dsp_thread which is what should wake),
-            // BUT — `std::thread::park()` parks the CURRENT thread regardless of which
-            // wake's `worker` field. The `worker.unpark()` matters only for waking; if
-            // the dsp_thread is the one calling `park()`, it parks itself. Any other
-            // thread's `unpark()` of the dsp_thread wakes it. So passing a wake bound to
-            // the engine-loop thread fails to wake the dsp_thread.
-            //
-            // CORRECT FIX: worker::spawn must build the wake handle internally after the
-            // dsp_thread spawn. Phase 1's spawn() does NOT do this (it takes wake as an
-            // argument). We must therefore drive the wake-binding outside spawn().
-            //
-            // See the actual `spawn` site below: we open-code the dsp_thread spawn here
-            // to retrieve the thread handle, then construct the wake bound to it, then
-            // spawn the pump.
-            DspWakeHandle::new(std::thread::current()),
         )
         .map_err(EngineBootError::SpawnWorker)?;
 

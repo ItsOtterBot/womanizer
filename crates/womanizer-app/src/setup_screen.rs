@@ -55,10 +55,14 @@ pub fn render(state: &mut SetupState, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.button("Test detection").clicked() {
             let r = womanizer_engine::detect();
-            // On Found, arm the 1-second success-flash timer (D-11). The app.rs update loop
-            // observes the elapsed timer next frame and transitions to Ready.
-            if matches!(r, DetectionResult::Found { .. }) {
+            // On Found, arm the 1-second success-flash timer (D-11) AND store the detected
+            // device name into picked_vout so the Setup → Ready transition uses it as
+            // EngineState.selected_virtual_output. Without this step, a successful detection
+            // still drops to the host-default-output fallback (the original bug —
+            // virtual-output stream ended up on the user's Headphones instead of CABLE Input).
+            if let DetectionResult::Found { device_name, .. } = &r {
                 state.flash_until = Some(Instant::now() + Duration::from_secs(1));
+                state.picked_vout = Some(device_name.clone());
             } else {
                 // NotFound clears any previous flash timer so the user can re-test cleanly.
                 state.flash_until = None;

@@ -92,9 +92,15 @@ pub struct WorkerHandles {
 ///   Phase 1.
 /// - `_snap_out`: triple_buffer Output side for VoiceParams. Phase 1 ignores it; Phase 2
 ///   reads it on every loop iteration to drive the signalsmith stretcher.
-/// - `wake`: clone of the DspWakeHandle bound to this worker thread; the capture-pump
-///   thread holds the other clone and calls `wake.wake()`.
 /// - `stop_flag`: shared shutdown signal.
+///
+/// Returns `(JoinHandle, DspWakeHandle)`. The wake handle is bound to the spawned thread's
+/// [`Thread`] (constructed via a one-shot channel so the caller never has to reach for a
+/// stale `thread::current()` outside the spawned closure). This must be the only constructor
+/// used in production: a wake bound to any other thread would have `wake.wake()` call
+/// `unpark()` on the wrong target, leaving the DSP worker permanently parked — the original
+/// Phase 1 close-out bug flagged in `.planning/.../deferred-items.md` (no mic → playback
+/// data flow).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_dsp_worker(
     mut in_rx: Consumer<AudioFrame>,
@@ -102,12 +108,25 @@ pub fn spawn_dsp_worker(
     mut mo_tx: Producer<AudioFrame>,
     hot: Arc<HotParams>,
     mut _snap_out: triple_buffer::Output<VoiceParams>,
-    wake: DspWakeHandle,
     stop_flag: Arc<AtomicBool>,
-) -> std::io::Result<JoinHandle<()>> {
-    Builder::new()
+) -> std::io::Result<(JoinHandle<()>, DspWakeHandle)> {
+    // The wake handle must be bound to the DSP worker thread, which doesn't exist yet. Use a
+    // one-shot channel so the spawned thread can hand its own `Thread` handle back to the
+    // caller; the wake is constructed here on the caller side using that handle. This avoids
+    // the temptation to construct the wake against `thread::current()` in the caller, which
+    // would silently bind to the wrong thread and break the wake mechanism.
+    let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel::<std::thread::Thread>(1);
+    let stop_flag_inner = stop_flag.clone();
+    let thread = Builder::new()
         .name("womanizer-dsp-worker".to_string())
         .spawn(move || {
+            // Construct the wake handle bound to the current thread BEFORE entering the loop;
+            // hand a clone back to the caller via the one-shot channel.
+            let wake = DspWakeHandle::new(std::thread::current());
+            // Send the bound thread handle back to the caller so it can construct an
+            // equivalent wake (same pending Arc — see below) for the pump thread.
+            let _ = handle_tx.send(std::thread::current());
+
             // Stack-allocated scratch buffers — never touched by another thread. Allocated
             // once on thread spawn so the inner loop is alloc-free (assert_no_alloc requires
             // it). Phase 1 only needs `processed` (memcpy passthrough); Phase 2 will use both
@@ -115,13 +134,13 @@ pub fn spawn_dsp_worker(
             let mut scratch = [0f32; BLOCK];
             let mut processed = [0f32; BLOCK];
             loop {
-                if stop_flag.load(Ordering::Relaxed) {
+                if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
                 }
                 // Park until the capture-pump signals us. Acquire-orders any samples pushed
                 // into InputRing before the wake() so they are visible after wait() returns.
                 wake.wait();
-                if stop_flag.load(Ordering::Relaxed) {
+                if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
                 }
                 // Drain all available BLOCK-sized chunks. The capture-pump thread waits for
@@ -151,7 +170,15 @@ pub fn spawn_dsp_worker(
                     }
                 }
             }
-        })
+        })?;
+    // Receive the DSP thread's own handle; construct a wake against it. The pump thread will
+    // call `wake.wake()` → `dsp_thread.unpark()` and the DSP worker will observe the pending
+    // flag in its `wait()` loop.
+    let dsp_thread_handle = handle_rx
+        .recv()
+        .expect("dsp worker thread must send its Thread handle on spawn");
+    let wake = DspWakeHandle::new(dsp_thread_handle);
+    Ok((thread, wake))
 }
 
 /// Spawn the capture-pump thread that observes `samples_since_wake` (bumped by the cpal
@@ -204,18 +231,12 @@ pub fn spawn(
     samples_since_wake: Arc<AtomicUsize>,
     hot: Arc<HotParams>,
     snap_out: triple_buffer::Output<VoiceParams>,
-    wake: DspWakeHandle,
 ) -> std::io::Result<WorkerHandles> {
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let dsp_thread = spawn_dsp_worker(
-        in_rx,
-        vo_tx,
-        mo_tx,
-        hot,
-        snap_out,
-        wake.clone(),
-        stop_flag.clone(),
-    )?;
+    // spawn_dsp_worker constructs the wake handle bound to the spawned DSP thread; the pump
+    // thread receives a clone so it can `unpark()` the DSP thread correctly.
+    let (dsp_thread, wake) =
+        spawn_dsp_worker(in_rx, vo_tx, mo_tx, hot, snap_out, stop_flag.clone())?;
     let pump_thread = spawn_capture_pump(samples_since_wake, wake, stop_flag.clone())?;
     Ok(WorkerHandles {
         dsp_thread,
