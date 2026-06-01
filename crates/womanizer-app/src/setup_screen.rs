@@ -81,4 +81,46 @@ pub fn render(state: &mut SetupState, ctx: &egui::Context, ui: &mut egui::Ui) {
             }
         }
     }
+
+    // --- Manual-pick fallback (D-11 escape hatch) ---
+    //
+    // Shown only after a failed detection so first-run users see the strict-regex path first
+    // (DEVICE-05 + D-08). If the user is on a multi-cable installer, or cpal's WASAPI endpoint
+    // names diverge from the friendly names shown in the Windows audio panel, they can pick
+    // their virtual output device directly. The pick is moved into EngineState on transition,
+    // bypassing the host-default fallback.
+    if matches!(state.last_detection, Some(DetectionResult::NotFound { .. })) {
+        ui.separator();
+        ui.label("Or pick the virtual output device manually:");
+        let outputs = womanizer_engine::enumerate_outputs();
+        if outputs.is_empty() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "(no output devices enumerated — cpal returned an empty list)",
+            );
+        } else {
+            let current = state
+                .picked_vout
+                .clone()
+                .unwrap_or_else(|| "— choose a device —".to_string());
+            egui::ComboBox::from_id_salt("manual-vout-pick")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for name in &outputs {
+                        ui.selectable_value(&mut state.picked_vout, Some(name.clone()), name);
+                    }
+                });
+            ui.horizontal(|ui| {
+                let can_advance = state.picked_vout.is_some();
+                if ui
+                    .add_enabled(can_advance, egui::Button::new("Use this device"))
+                    .clicked()
+                {
+                    // Skip the success flash on the manual path — the user has already
+                    // explicitly picked, so transition on the next frame.
+                    state.flash_until = Some(Instant::now());
+                }
+            });
+        }
+    }
 }

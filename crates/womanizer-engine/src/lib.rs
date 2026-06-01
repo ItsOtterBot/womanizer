@@ -38,7 +38,7 @@ pub use event_loop::{spawn as spawn_engine, EngineHandle, EngineState};
 
 // Re-export the cpal-side UI surface: device enumeration for the Ready shell's input row
 // (AUDIO-01), the BLOCK / SAMPLE_RATE_HZ engine constants for any UI surface that needs them.
-pub use cpal_io::{enumerate_inputs, BLOCK, SAMPLE_RATE_HZ};
+pub use cpal_io::{enumerate_inputs, enumerate_outputs, BLOCK, SAMPLE_RATE_HZ};
 
 // Re-export the banner-state publishers and verbatim copy constants that Plan 01-05's
 // Ready shell consumes for the three yellow banners (AUDIO-04 sample-rate-mismatch,

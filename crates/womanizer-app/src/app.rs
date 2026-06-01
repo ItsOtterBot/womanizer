@@ -64,6 +64,13 @@ pub struct SetupState {
     /// `Some(Instant::now() + 1s)`; while not yet elapsed, the green `✓ detected` label is
     /// shown. Once elapsed, the app transitions to Ready on the next `update()` call.
     pub flash_until: Option<Instant>,
+    /// Manual-pick fallback (D-11 escape hatch). When strict-regex detection misses the user's
+    /// virtual cable (multi-cable installer variants, divergent WASAPI endpoint names), the
+    /// setup screen exposes a dropdown of all enumerated output devices. Selecting one and
+    /// clicking "Use this device" stores it here and triggers the same Setup → Ready
+    /// transition as a successful detect(): the engine's `selected_virtual_output` is set to
+    /// this name (bypassing host-default fallback) so the user's pick reaches the cpal stream.
+    pub picked_vout: Option<String>,
 }
 
 impl SetupState {
@@ -78,6 +85,7 @@ impl SetupState {
             last_mon,
             last_detection: None,
             flash_until: None,
+            picked_vout: None,
         }
     }
 }
@@ -210,10 +218,15 @@ impl eframe::App for App {
             App::Setup(s) => {
                 if App::should_transition_now(s) {
                     // Take the device-id slots OUT of SetupState before constructing
-                    // EngineState — they're moved, not cloned.
+                    // EngineState — they're moved, not cloned. A manual pick (picked_vout)
+                    // overrides the last-selected slot so the user's chosen device reaches
+                    // the cpal stream instead of the host default.
                     let initial_state = EngineState {
                         selected_input: s.last_input.take(),
-                        selected_virtual_output: s.last_vout.take(),
+                        selected_virtual_output: s
+                            .picked_vout
+                            .take()
+                            .or_else(|| s.last_vout.take()),
                     };
                     let handle = spawn_engine(
                         initial_state,

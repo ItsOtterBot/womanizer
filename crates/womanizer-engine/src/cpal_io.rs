@@ -268,6 +268,29 @@ pub fn enumerate_inputs() -> Vec<String> {
     }
 }
 
+/// Enumerate output devices via cpal — used by the Setup screen's manual-pick fallback when
+/// strict-regex detection misses the user's virtual cable (e.g. multi-cable installer variants
+/// or WASAPI endpoint names that diverge from the friendly name shown in the Windows control
+/// panel). Same shape and failure semantics as [`enumerate_inputs`].
+pub fn enumerate_outputs() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.output_devices() {
+        Ok(iter) => iter
+            .filter_map(|d| match d.description() {
+                Ok(desc) => Some(desc.name().to_string()),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to read output device description; skipping");
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = ?e, "cpal::Host::output_devices() failed; returning empty list");
+            Vec::new()
+        }
+    }
+}
+
 /// Build the RT-safe capture stream (mic → InputRing).
 ///
 /// Closure body is wrapped in `assert_no_alloc(|| { … })` and:
