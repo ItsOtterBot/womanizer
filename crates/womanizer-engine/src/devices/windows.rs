@@ -41,6 +41,50 @@ static CABLE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// design), the first one is selected.
 pub fn detect() -> DetectionResult {
     let host = cpal::default_host();
+    tracing::info!(host_id = ?host.id(), "WINDOWS DEBUG: cpal host selected");
+
+    // Probe every cpal enumeration path so we can see exactly what the Windows backend
+    // returns. Each Test detection click prints one block of these `WINDOWS DEBUG:` lines.
+    match host
+        .default_input_device()
+        .and_then(|d| d.description().ok())
+    {
+        Some(d) => tracing::info!(name = %d.name(), "WINDOWS DEBUG: host default INPUT device"),
+        None => tracing::warn!("WINDOWS DEBUG: host has NO default input device"),
+    }
+    match host
+        .default_output_device()
+        .and_then(|d| d.description().ok())
+    {
+        Some(d) => tracing::info!(name = %d.name(), "WINDOWS DEBUG: host default OUTPUT device"),
+        None => tracing::warn!("WINDOWS DEBUG: host has NO default output device"),
+    }
+    match host.input_devices() {
+        Ok(iter) => {
+            let names: Vec<String> = iter
+                .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+                .collect();
+            tracing::info!(
+                count = names.len(),
+                ?names,
+                "WINDOWS DEBUG: all INPUT devices"
+            );
+        }
+        Err(e) => tracing::error!(error = ?e, "WINDOWS DEBUG: host.input_devices() FAILED"),
+    }
+    match host.output_devices() {
+        Ok(iter) => {
+            let names: Vec<String> = iter
+                .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+                .collect();
+            tracing::info!(
+                count = names.len(),
+                ?names,
+                "WINDOWS DEBUG: all OUTPUT devices"
+            );
+        }
+        Err(e) => tracing::error!(error = ?e, "WINDOWS DEBUG: host.output_devices() FAILED"),
+    }
 
     let matched: Vec<(cpal::Device, String)> = host
         .output_devices()
