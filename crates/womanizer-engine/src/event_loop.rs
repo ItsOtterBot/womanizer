@@ -530,8 +530,13 @@ impl Engine {
             worker
                 .stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            // Best-effort unpark — the DSP worker checks stop_flag right after waking.
-            worker.dsp_thread.thread().unpark();
+            // CRITICAL: a bare `unpark()` is NOT sufficient — `wake.wait()` only exits its
+            // park-loop when `pending` is true, and a bare unpark leaves `pending=false`, so
+            // the DSP worker would just re-park forever and `join()` would deadlock (the
+            // hang Andrew hit live: Stop click → event loop frozen → Start ignored). Use the
+            // full `wake()` (sets `pending=true` AND unparks) so the wait() loop observes
+            // pending, returns, then checks stop_flag and exits.
+            worker.stop_wake.wake();
             // join() returns Result<()> wrapping the thread's panic if any; ignore both
             // outcomes in the stop path (panics surface separately via tracing in worker).
             let _ = worker.dsp_thread.join();

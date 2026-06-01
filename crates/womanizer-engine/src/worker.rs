@@ -74,6 +74,13 @@ pub struct WorkerHandles {
     pub pump_thread: JoinHandle<()>,
     /// Shared stop flag — set by the event loop on Stop; observed by both threads.
     pub stop_flag: Arc<AtomicBool>,
+    /// Wake handle bound to the DSP thread. The event loop's Stop handler MUST call
+    /// `wake.wake()` AFTER setting `stop_flag = true` so the DSP worker exits its
+    /// `wake.wait()` park-loop and observes the stop flag. Without this, the wait() loop
+    /// (which only checks `pending`, not `stop_flag`) just re-parks after a bare `unpark()`
+    /// and `join()` deadlocks indefinitely — the original Phase 1 close-out hang where
+    /// clicking Stop froze the engine event loop and prevented restart.
+    pub stop_wake: DspWakeHandle,
 }
 
 /// Spawn the DSP worker thread that parks on `wake.wait()`, drains `in_rx` in BLOCK-sized
@@ -246,14 +253,18 @@ pub fn spawn(
 ) -> std::io::Result<WorkerHandles> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     // spawn_dsp_worker constructs the wake handle bound to the spawned DSP thread; the pump
-    // thread receives a clone so it can `unpark()` the DSP thread correctly.
+    // thread receives a clone so it can `unpark()` the DSP thread correctly. The same wake
+    // is stashed on WorkerHandles so the Stop handler can `wake.wake()` to break the DSP
+    // worker out of its `wait()` park-loop (otherwise `join()` deadlocks — see WorkerHandles
+    // docs above).
     let (dsp_thread, wake) =
         spawn_dsp_worker(in_rx, vo_tx, mo_tx, hot, snap_out, stop_flag.clone())?;
-    let pump_thread = spawn_capture_pump(samples_since_wake, wake, stop_flag.clone())?;
+    let pump_thread = spawn_capture_pump(samples_since_wake, wake.clone(), stop_flag.clone())?;
     Ok(WorkerHandles {
         dsp_thread,
         pump_thread,
         stop_flag,
+        stop_wake: wake,
     })
 }
 
