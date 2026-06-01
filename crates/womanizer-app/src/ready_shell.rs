@@ -18,8 +18,8 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 use womanizer_engine::{
-    enumerate_inputs, EngineCommand, DISCONNECT_BANNER_COPY, FEEDBACK_BANNER_COPY,
-    RESAMPLE_BANNER_TEMPLATE,
+    enumerate_inputs, enumerate_outputs, EngineCommand, DISCONNECT_BANNER_COPY,
+    FEEDBACK_BANNER_COPY, RESAMPLE_BANNER_TEMPLATE,
 };
 
 use crate::app::ReadyState;
@@ -78,18 +78,81 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
     // -------- App header --------
     ui.heading("Womanizer");
 
-    // -------- Device row (Phase 1: read-only; Phase 4 wires the dropdowns) --------
+    // -------- Device pickers (input mic + virtual output) --------
+    //
+    // Picker changes send `EngineCommand::SetInput` / `SetVirtualOutput` on `cmd_tx`. The
+    // engine event loop updates its in-memory `EngineState` and, if streams are running,
+    // tears down + rebuilds atomically so the new device takes effect without a Stop click.
+    // Phase 4 will replace this with persistent dropdowns backed by the settings table.
+
     ui.horizontal(|ui| {
-        ui.label("Input:");
-        // Show the first available input device name. Phase 4 will replace this with a
-        // dropdown populated from `enumerate_inputs()` and persist the user's selection to
-        // the settings table.
+        ui.label("Input mic:");
         let inputs = enumerate_inputs();
-        let label = inputs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "<no device>".to_string());
-        ui.label(format!("Default: {label}"));
+        let current = state
+            .selected_input
+            .clone()
+            .unwrap_or_else(|| "(host default)".to_string());
+        let mut new_pick: Option<Option<String>> = None;
+        egui::ComboBox::from_id_salt("ready-input-pick")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.selected_input.is_none(), "(host default)")
+                    .clicked()
+                {
+                    new_pick = Some(None);
+                }
+                for name in &inputs {
+                    if ui
+                        .selectable_label(
+                            state.selected_input.as_deref() == Some(name.as_str()),
+                            name,
+                        )
+                        .clicked()
+                    {
+                        new_pick = Some(Some(name.clone()));
+                    }
+                }
+            });
+        if let Some(p) = new_pick {
+            state.selected_input = p.clone();
+            let _ = state.handle.cmd_tx.send(EngineCommand::SetInput(p));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Virtual output:");
+        let outputs = enumerate_outputs();
+        let current = state
+            .selected_vout
+            .clone()
+            .unwrap_or_else(|| "(host default)".to_string());
+        let mut new_pick: Option<Option<String>> = None;
+        egui::ComboBox::from_id_salt("ready-vout-pick")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.selected_vout.is_none(), "(host default)")
+                    .clicked()
+                {
+                    new_pick = Some(None);
+                }
+                for name in &outputs {
+                    if ui
+                        .selectable_label(
+                            state.selected_vout.as_deref() == Some(name.as_str()),
+                            name,
+                        )
+                        .clicked()
+                    {
+                        new_pick = Some(Some(name.clone()));
+                    }
+                }
+            });
+        if let Some(p) = new_pick {
+            state.selected_vout = p.clone();
+            let _ = state.handle.cmd_tx.send(EngineCommand::SetVirtualOutput(p));
+        }
     });
 
     // -------- Monitor checkbox (D-12 verbatim inline label) --------

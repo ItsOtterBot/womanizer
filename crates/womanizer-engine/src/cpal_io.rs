@@ -152,19 +152,44 @@ pub type TimestampPair = (u64, StreamInstant);
 /// `EngineBuildError::NoCompatibleConfig` so the UI can render the device row as red.
 pub fn pick_input_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineBuildError> {
     let target: SampleRate = SAMPLE_RATE_HZ;
-    let supported = device
-        .supported_input_configs()?
-        .find(|range| {
-            range.channels() == INPUT_CHANNELS
-                && range.sample_format() == SampleFormat::F32
-                && range.min_sample_rate() <= target
-                && range.max_sample_rate() >= target
-        })
-        .ok_or(EngineBuildError::NoCompatibleConfig {
-            channels: INPUT_CHANNELS,
-        })?
-        .with_sample_rate(target);
-    assert_collapsed_config(&supported, INPUT_CHANNELS)?;
+
+    // Prefer mono (1ch — the engine is single-channel end-to-end). Fall back to stereo (2ch);
+    // [`build_capture_stream`] downmixes L+R in its callback so the engine still sees mono
+    // frames. Many consumer mics + USB interfaces (and VB-CABLE Output) only advertise
+    // stereo; refusing them would lock out real users.
+    let mut mono_candidate: Option<cpal::SupportedStreamConfigRange> = None;
+    let mut stereo_candidate: Option<cpal::SupportedStreamConfigRange> = None;
+    for range in device.supported_input_configs()? {
+        let rate_ok = range.min_sample_rate() <= target && range.max_sample_rate() >= target;
+        let fmt_ok = range.sample_format() == SampleFormat::F32;
+        if !rate_ok || !fmt_ok {
+            continue;
+        }
+        match range.channels() {
+            1 if mono_candidate.is_none() => mono_candidate = Some(range),
+            2 if stereo_candidate.is_none() => stereo_candidate = Some(range),
+            _ => {}
+        }
+    }
+    let range =
+        mono_candidate
+            .or(stereo_candidate)
+            .ok_or(EngineBuildError::NoCompatibleConfig {
+                channels: INPUT_CHANNELS,
+            })?;
+    let supported = range.with_sample_rate(target);
+    // Assert rate + format. Channel count is intentionally NOT asserted here: the input path
+    // accepts either 1 or 2 channels and the callback downmixes stereo → mono.
+    if supported.sample_rate() != SAMPLE_RATE_HZ {
+        return Err(EngineBuildError::NegotiatedWrongRate {
+            got: supported.sample_rate(),
+        });
+    }
+    if supported.sample_format() != SampleFormat::F32 {
+        return Err(EngineBuildError::NegotiatedWrongFormat {
+            got: supported.sample_format(),
+        });
+    }
     Ok(supported)
 }
 
@@ -323,6 +348,7 @@ pub fn build_capture_stream(
 ) -> Result<cpal::Stream, EngineBuildError> {
     let supported = pick_input_config(device)?;
     let buffer_size = pick_buffer_size(supported.buffer_size());
+    let n_channels = supported.channels() as usize;
     let requested = StreamConfig {
         channels: supported.channels(),
         sample_rate: supported.sample_rate(),
@@ -335,31 +361,50 @@ pub fn build_capture_stream(
     let block_seq = Arc::new(AtomicU64::new(0));
     let block_seq_cb = block_seq.clone();
 
+    // Max frames per callback we'll downmix in a single pass. The buffer-size request is
+    // Fixed(BLOCK); some backends round up. 4*BLOCK = 1024 frames = 4 KB on the stack is a
+    // generous ceiling for any plausible cpal callback grouping. If a backend exceeds this,
+    // we truncate (the assertion below is allocation-free).
+    const MONO_BUF_LEN: usize = BLOCK * 4;
+
     let stream = device.build_input_stream::<f32, _, _>(
         &requested,
         move |data: &[f32], info: &cpal::InputCallbackInfo| {
             // RT-SHAPED region: no allocation, no lock, no syscall, no log, no panic, no Box.
             // Mirrors smoke.rs lines 96-105 + the `stub_dsp_callback` shape verbatim.
             assert_no_alloc(|| {
-                // 1. Push samples into InputRing — drop-on-Full per Pattern B (the engine
-                //    surfaces device-level faults via the error_callback path, not here).
-                let _ = in_tx.push_entire_slice(data);
+                // Compute frame count from the channel count cpal negotiated. Stack-allocated
+                // mono buffer for the downmix path — no heap allocation.
+                let frames = data.len() / n_channels.max(1);
+                if n_channels == 1 {
+                    // Mono fast path — push the input slice directly.
+                    let _ = in_tx.push_entire_slice(data);
+                    let sum_sq: f32 = data.iter().map(|s| s * s).sum();
+                    let rms = (sum_sq / data.len().max(1) as f32).sqrt();
+                    tele.input_rms.store(rms, Ordering::Relaxed);
+                } else {
+                    // Stereo (or higher) — downmix to mono by averaging the first two channels
+                    // and discarding any extras. Most consumer interfaces expose exactly 2.
+                    let mut mono = [0.0f32; MONO_BUF_LEN];
+                    let n = frames.min(MONO_BUF_LEN);
+                    for (i, slot) in mono.iter_mut().take(n).enumerate() {
+                        let base = i * n_channels;
+                        *slot = (data[base] + data[base + 1]) * 0.5;
+                    }
+                    let _ = in_tx.push_entire_slice(&mono[..n]);
+                    let sum_sq: f32 = mono[..n].iter().map(|s| s * s).sum();
+                    let rms = (sum_sq / n.max(1) as f32).sqrt();
+                    tele.input_rms.store(rms, Ordering::Relaxed);
+                }
 
-                // 2. Mono RMS into Telemetry::input_rms (atomic, overwrite-latest). Used by
-                //    the UI level meter AND by the feedback-loop detector (D-13).
-                let sum_sq: f32 = data.iter().map(|s| s * s).sum();
-                let rms = (sum_sq / data.len().max(1) as f32).sqrt();
-                tele.input_rms.store(rms, Ordering::Relaxed);
+                // Bump samples_since_wake by frame count (the worker downstream consumes mono
+                // frames, not interleaved samples). Release ordering pairs with the pump
+                // thread's Acquire load so any data pushed above is visible after the wake.
+                samples_since_wake.fetch_add(frames, Ordering::Release);
 
-                // 3. Bump samples_since_wake for the capture-pump thread (NOT for the worker —
-                //    we cannot call wake() here per wake.rs:8-14). Release ordering pairs with
-                //    the capture-pump thread's Acquire load so any data pushed above is visible
-                //    to the worker once it observes the wake.
-                samples_since_wake.fetch_add(data.len(), Ordering::Release);
-
-                // 4. Push (seq, capture-instant) for latency pairing. Drop-on-Full — the
-                //    playback side reads opportunistically and skips on miss (D-06 + A3
-                //    clock-origin caveat documented above).
+                // Push (seq, capture-instant) for latency pairing. Drop-on-Full — the
+                // playback side reads opportunistically and skips on miss (D-06 + A3
+                // clock-origin caveat documented above).
                 let seq = block_seq_cb.fetch_add(1, Ordering::Relaxed);
                 let _ = ts_tx.push((seq, info.timestamp().capture));
             });
@@ -611,7 +656,11 @@ mod tests {
         match pick_input_config(&device) {
             Ok(cfg) => {
                 assert_eq!(cfg.sample_rate(), SAMPLE_RATE_HZ, "must be 48 kHz");
-                assert_eq!(cfg.channels(), INPUT_CHANNELS, "must be mono");
+                assert!(
+                    matches!(cfg.channels(), 1 | 2),
+                    "must be mono or stereo (stereo gets downmixed in the callback); got {}",
+                    cfg.channels()
+                );
                 assert_eq!(cfg.sample_format(), SampleFormat::F32, "must be f32");
             }
             Err(EngineBuildError::NoCompatibleConfig { .. }) => {

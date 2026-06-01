@@ -196,6 +196,23 @@ impl Engine {
                     // D-01 (memcpy passthrough).
                     tracing::debug!(?id, "SelectVoice received (Phase 4 wiring placeholder)");
                 }
+                Ok(EngineCommand::SetInput(name)) => {
+                    tracing::info!(?name, "SetInput received");
+                    self.state.selected_input = name;
+                    // Hot-swap if streams are live: tear down + rebuild against the new device.
+                    if self.streams.is_some() {
+                        self.handle_stop_silent();
+                        self.handle_start();
+                    }
+                }
+                Ok(EngineCommand::SetVirtualOutput(name)) => {
+                    tracing::info!(?name, "SetVirtualOutput received");
+                    self.state.selected_virtual_output = name;
+                    if self.streams.is_some() {
+                        self.handle_stop_silent();
+                        self.handle_start();
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     self.drain_error_ring();
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms

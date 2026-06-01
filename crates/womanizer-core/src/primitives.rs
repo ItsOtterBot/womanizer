@@ -68,6 +68,12 @@ pub enum EngineCommand {
     Stop,
     /// Switch the active voice to the given voice-library row id.
     SelectVoice(i64),
+    /// Set the capture device by name. `None` means "fall back to host default".
+    /// The engine updates its in-memory `EngineState.selected_input` and, if currently
+    /// running, tears down + rebuilds streams so the change takes effect immediately.
+    SetInput(Option<String>),
+    /// Set the virtual-output device by name. Same semantics as [`Self::SetInput`].
+    SetVirtualOutput(Option<String>),
 }
 
 /// Discrete events from the engine to the UI. **Off-audio-thread only.**

@@ -15,7 +15,7 @@
 /// constant. The multi-cable installer variants (`CABLE-A Input`, `CABLE-B Input`, …) do NOT
 /// match this strict regex by design; if multi-cable support is needed in a future phase,
 /// add a sibling regex `^CABLE-[A-Z]? Input \(VB-Audio Cable [A-Z]?\)$` and union the results.
-pub const VB_CABLE_REGEX: &str = r"(?i)^CABLE Input \(VB-Audio Virtual Cable\)$";
+pub const VB_CABLE_REGEX: &str = r"(?i)^CABLE Input(?: \(VB-Audio Virtual Cable\))?$";
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -127,12 +127,24 @@ mod regex_tests {
     }
 
     #[test]
-    fn regex_rejects_partial_or_padded_match() {
+    fn regex_matches_cpal_truncated_name() {
+        // cpal 0.17 on Windows returns just `"CABLE Input"` (PKEY_Device_FriendlyName) —
+        // NOT the composited `"CABLE Input (VB-Audio Virtual Cable)"` the Windows audio
+        // control panel shows. The strict regex was rewritten to accept both forms.
         let re = regex::Regex::new(VB_CABLE_REGEX).unwrap();
         assert!(
-            !re.is_match("CABLE Input"),
-            "partial name (no parens) must fail the anchors"
+            re.is_match("CABLE Input"),
+            "cpal-truncated name must match the strict regex"
         );
+        assert!(
+            !re.is_match("CABLE In 16ch"),
+            "16-channel premium variant must NOT match (wrong device for our 48k/stereo pipeline)"
+        );
+    }
+
+    #[test]
+    fn regex_rejects_padded_match() {
+        let re = regex::Regex::new(VB_CABLE_REGEX).unwrap();
         assert!(
             !re.is_match("Some Prefix - CABLE Input (VB-Audio Virtual Cable) - suffix"),
             "padded match must fail the whole-string anchors"

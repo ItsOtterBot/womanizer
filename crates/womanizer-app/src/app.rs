@@ -112,16 +112,30 @@ pub struct ReadyState {
     /// monitor_banner.disconnected && !disconnect_dismissed" gate avoids race conditions
     /// with the engine clearing the atomic on rebuild.
     pub disconnect_dismissed: bool,
+    /// UI-side mirror of the engine's `EngineState.selected_input`. The Ready shell's input
+    /// dropdown reads + writes this; on change, sends `EngineCommand::SetInput` so the
+    /// engine hot-swaps. `None` means "fall back to host default" (cpal's
+    /// `default_input_device`).
+    pub selected_input: Option<String>,
+    /// UI-side mirror of the engine's `EngineState.selected_virtual_output`. Same semantics
+    /// as [`Self::selected_input`].
+    pub selected_vout: Option<String>,
 }
 
 impl ReadyState {
-    fn new(handle: EngineHandle) -> Self {
+    fn new(
+        handle: EngineHandle,
+        selected_input: Option<String>,
+        selected_vout: Option<String>,
+    ) -> Self {
         let monitor_banner = handle.monitor_banner.clone();
         Self {
             handle,
             sample_rate_state: SampleRateState::new(),
             monitor_banner,
             disconnect_dismissed: false,
+            selected_input,
+            selected_vout,
         }
     }
 }
@@ -221,19 +235,18 @@ impl eframe::App for App {
                     // EngineState — they're moved, not cloned. A manual pick (picked_vout)
                     // overrides the last-selected slot so the user's chosen device reaches
                     // the cpal stream instead of the host default.
+                    let selected_input = s.last_input.take();
+                    let selected_vout = s.picked_vout.take().or_else(|| s.last_vout.take());
                     let initial_state = EngineState {
-                        selected_input: s.last_input.take(),
-                        selected_virtual_output: s
-                            .picked_vout
-                            .take()
-                            .or_else(|| s.last_vout.take()),
+                        selected_input: selected_input.clone(),
+                        selected_virtual_output: selected_vout.clone(),
                     };
                     let handle = spawn_engine(
                         initial_state,
                         std::sync::Arc::new(default_hot_params()),
                         std::sync::Arc::new(default_telemetry()),
                     );
-                    *self = App::Ready(ReadyState::new(handle));
+                    *self = App::Ready(ReadyState::new(handle, selected_input, selected_vout));
                     // Repaint immediately so the Ready shell renders without a one-frame
                     // gap of stale Setup content.
                     ctx.request_repaint();
