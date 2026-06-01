@@ -12,8 +12,8 @@
 //!    device active for capture; capability metadata is read-only and is the safe pre-flight).
 //! 4. Returns the typed `DetectionResult`.
 //!
-//! Sibling helper [`enumerate_matched_cables`] exposes the candidate list when multiple
-//! devices match (D-19 multi-cable case) so Plan 01-05's UI dropdown can present a chooser.
+//! Multi-cable installer variants (`CABLE-A Input`, etc.) do not match the strict regex by
+//! design — if a future phase needs a chooser, enumerate against a broader pattern there.
 
 use std::sync::LazyLock;
 
@@ -38,8 +38,7 @@ static CABLE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 ///
 /// Multi-cable handling: if multiple devices match (uncommon — VB-Audio's multi-cable
 /// installer ships `CABLE-A Input` / `CABLE-B Input` which do NOT match the strict regex by
-/// design), the first one is selected. Plan 01-05's UI uses [`enumerate_matched_cables`] to
-/// present a chooser dropdown when more than one matches.
+/// design), the first one is selected.
 pub fn detect() -> DetectionResult {
     let host = cpal::default_host();
 
@@ -104,29 +103,4 @@ pub fn detect() -> DetectionResult {
     };
     tracing::info!(?result, "Windows VB-CABLE detection");
     result
-}
-
-/// Return the list of output-device names matching the VB-CABLE strict regex.
-///
-/// Plan 01-05's UI dropdown calls this when offering a chooser between multiple matched
-/// cables. The strict regex `^CABLE Input \(VB-Audio Virtual Cable\)$` only matches the
-/// single canonical VB-CABLE; multi-cable installer variants like `CABLE-A Input
-/// (VB-Audio Cable A)` do NOT match by design (D-19, Pitfall #6).
-///
-/// If multi-cable support is needed in a future phase, add a sibling regex
-/// `^CABLE-[A-Z]? Input \(VB-Audio Cable [A-Z]?\)$` and union the results.
-pub fn enumerate_matched_cables() -> Vec<String> {
-    let host = cpal::default_host();
-    host.output_devices()
-        .into_iter()
-        .flatten()
-        .filter_map(|d| {
-            let name = d.description().ok()?.name().to_string();
-            if CABLE_RE.is_match(&name) {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
