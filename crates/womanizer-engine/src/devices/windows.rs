@@ -50,7 +50,9 @@ pub fn detect() -> DetectionResult {
             // cpal 0.17 deprecated name() in favor of description().name() — use the
             // non-deprecated path to match Plan 01-02a's enumerate_inputs() shape.
             let name = d.description().ok()?.name().to_string();
-            if CABLE_RE.is_match(&name) {
+            let matched = CABLE_RE.is_match(&name);
+            tracing::info!(name = %name, matched, len = name.len(), "enumerated output device");
+            if matched {
                 Some((d, name))
             } else {
                 None
