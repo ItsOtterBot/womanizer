@@ -46,14 +46,9 @@ pub struct SetupState {
     /// Last-selected virtual-output device name (the rebranded BlackHole on macOS, the
     /// matched CABLE Input on Windows). Same Phase 1 read-only contract as `last_input`.
     pub last_vout: Option<String>,
-    /// Last-selected self-monitor headphone device. Currently passed through but unused by
-    /// the engine — Plan 01-05's Ready shell does not pre-build a monitor stream because
-    /// the user must explicitly enable the monitor toggle (D-12 default OFF). Phase 4 will
-    /// wire dropdown CRUD on top of this slot.
-    #[allow(
-        dead_code,
-        reason = "Phase 4 will wire the monitor-device dropdown to read this"
-    )]
+    /// Last-selected self-monitor headphone device. Passed into `EngineState.selected_monitor`
+    /// on Setup → Ready transition; the Ready shell's headphone dropdown can change it live
+    /// via `EngineCommand::SetMonitor`. Phase 4 will wire dropdown CRUD on top of this slot.
     pub last_mon: Option<String>,
     /// Outcome of the most recent `Test detection` click. `None` before the first click.
     /// Rendered inline below the button per D-11:
@@ -120,6 +115,10 @@ pub struct ReadyState {
     /// UI-side mirror of the engine's `EngineState.selected_virtual_output`. Same semantics
     /// as [`Self::selected_input`].
     pub selected_vout: Option<String>,
+    /// UI-side mirror of the engine's `EngineState.selected_monitor` (headphones for the
+    /// self-monitor stream). Same semantics as [`Self::selected_input`]. Monitor failures
+    /// are non-fatal — `None` here means "use the host default output".
+    pub selected_monitor: Option<String>,
 }
 
 impl ReadyState {
@@ -127,6 +126,7 @@ impl ReadyState {
         handle: EngineHandle,
         selected_input: Option<String>,
         selected_vout: Option<String>,
+        selected_monitor: Option<String>,
     ) -> Self {
         let monitor_banner = handle.monitor_banner.clone();
         Self {
@@ -136,6 +136,7 @@ impl ReadyState {
             disconnect_dismissed: false,
             selected_input,
             selected_vout,
+            selected_monitor,
         }
     }
 }
@@ -237,16 +238,23 @@ impl eframe::App for App {
                     // the cpal stream instead of the host default.
                     let selected_input = s.last_input.take();
                     let selected_vout = s.picked_vout.take().or_else(|| s.last_vout.take());
+                    let selected_monitor = s.last_mon.take();
                     let initial_state = EngineState {
                         selected_input: selected_input.clone(),
                         selected_virtual_output: selected_vout.clone(),
+                        selected_monitor: selected_monitor.clone(),
                     };
                     let handle = spawn_engine(
                         initial_state,
                         std::sync::Arc::new(default_hot_params()),
                         std::sync::Arc::new(default_telemetry()),
                     );
-                    *self = App::Ready(ReadyState::new(handle, selected_input, selected_vout));
+                    *self = App::Ready(ReadyState::new(
+                        handle,
+                        selected_input,
+                        selected_vout,
+                        selected_monitor,
+                    ));
                     // Repaint immediately so the Ready shell renders without a one-frame
                     // gap of stale Setup content.
                     ctx.request_repaint();

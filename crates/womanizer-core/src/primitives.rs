@@ -74,6 +74,9 @@ pub enum EngineCommand {
     SetInput(Option<String>),
     /// Set the virtual-output device by name. Same semantics as [`Self::SetInput`].
     SetVirtualOutput(Option<String>),
+    /// Set the monitor (headphones) device by name. Same semantics as [`Self::SetInput`].
+    /// Monitor failures are non-fatal — the mic → virtual-output path continues regardless.
+    SetMonitor(Option<String>),
 }
 
 /// Discrete events from the engine to the UI. **Off-audio-thread only.**

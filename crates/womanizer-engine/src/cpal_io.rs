@@ -137,6 +137,10 @@ pub struct EngineStreams {
     pub input: cpal::Stream,
     /// Virtual-output stream (VirtualOutRing → device VRChat sees as mic). Stereo f32 @ 48 kHz.
     pub virtual_out: cpal::Stream,
+    /// Optional monitor (headphones) stream (MonitorOutRing → user's headphones). D-12 self-
+    /// monitor toggle gates audio inside the callback. `None` when the monitor device could
+    /// not be built (non-fatal — the mic → virtual-output path continues regardless).
+    pub monitor: Option<cpal::Stream>,
 }
 
 /// SPSC ring of (sequence number, capture-`StreamInstant`) pairs the capture callback pushes
@@ -269,6 +273,26 @@ fn pick_buffer_size(supported: &SupportedBufferSize) -> BufferSize {
     }
 }
 
+/// Compose a user-facing device name from cpal's `DeviceDescription`.
+///
+/// cpal on Windows returns short endpoint friendly names like `"Microphone"` for
+/// `description().name()` — losing the interface friendly name (`"NVIDIA Broadcast"`,
+/// `"Yeti X-Stream Audio"`, `"VB-Audio Virtual Cable"`) that makes the dropdown entry
+/// disambiguable. cpal stores the interface friendly name in `description().driver()`.
+/// This helper composites `"{name} ({driver})"` when a driver string is present and
+/// distinct from the name, otherwise returns `name` alone.
+///
+/// On macOS the `driver` field is typically `None` (CoreAudio doesn't expose the same
+/// dual-naming split), so the composed string is the same as the bare name — no regression.
+fn composed_device_name(desc: &cpal::DeviceDescription) -> String {
+    match desc.driver() {
+        Some(drv) if !drv.is_empty() && drv != desc.name() => {
+            format!("{} ({})", desc.name(), drv)
+        }
+        _ => desc.name().to_string(),
+    }
+}
+
 /// Enumerate input devices via cpal, returning a list of names for the UI dropdown (AUDIO-01).
 ///
 /// On hosts with no input devices (CI runners, headless containers) this returns an empty
@@ -279,7 +303,7 @@ pub fn enumerate_inputs() -> Vec<String> {
     match host.input_devices() {
         Ok(iter) => iter
             .filter_map(|d| match d.description() {
-                Ok(desc) => Some(desc.name().to_string()),
+                Ok(desc) => Some(composed_device_name(&desc)),
                 Err(e) => {
                     tracing::warn!(error = ?e, "failed to read input device description; skipping");
                     None
@@ -302,7 +326,7 @@ pub fn enumerate_outputs() -> Vec<String> {
     match host.output_devices() {
         Ok(iter) => iter
             .filter_map(|d| match d.description() {
-                Ok(desc) => Some(desc.name().to_string()),
+                Ok(desc) => Some(composed_device_name(&desc)),
                 Err(e) => {
                     tracing::warn!(error = ?e, "failed to read output device description; skipping");
                     None
@@ -314,6 +338,30 @@ pub fn enumerate_outputs() -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Match a composed name (`"endpoint (driver)"`) back to its cpal device. The reverse of
+/// [`composed_device_name`] — used by the event loop's `find_*_device_by_name` to resolve
+/// a UI-picked name to a device handle for stream construction.
+pub fn match_input_device_by_composed_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.input_devices().ok()?.find(|d| {
+        d.description()
+            .ok()
+            .as_ref()
+            .map(composed_device_name)
+            .is_some_and(|n| n == name)
+    })
+}
+
+/// Same as [`match_input_device_by_composed_name`] for output devices.
+pub fn match_output_device_by_composed_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.output_devices().ok()?.find(|d| {
+        d.description()
+            .ok()
+            .as_ref()
+            .map(composed_device_name)
+            .is_some_and(|n| n == name)
+    })
 }
 
 /// Build the RT-safe capture stream (mic → InputRing).

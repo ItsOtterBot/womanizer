@@ -47,11 +47,23 @@ pub fn detect() -> DetectionResult {
         .into_iter()
         .flatten()
         .filter_map(|d| {
-            // cpal 0.17 deprecated name() in favor of description().name() — use the
-            // non-deprecated path to match Plan 01-02a's enumerate_inputs() shape.
-            let name = d.description().ok()?.name().to_string();
-            if CABLE_RE.is_match(&name) {
-                Some((d, name))
+            // Compose `"endpoint (driver)"` like cpal_io::enumerate_outputs does so the
+            // returned Found.device_name matches the dropdown labels in the Ready shell —
+            // user picks consistently surface the same device when they manually re-pick.
+            // On Windows this evaluates to "CABLE Input (VB-Audio Virtual Cable)"; on macOS
+            // and on devices without a `driver` field it collapses to the bare endpoint name.
+            let desc = d.description().ok()?;
+            let composed = match desc.driver() {
+                Some(drv) if !drv.is_empty() && drv != desc.name() => {
+                    format!("{} ({})", desc.name(), drv)
+                }
+                _ => desc.name().to_string(),
+            };
+            // The strict regex still matches against the SHORT cpal-truncated form too, so
+            // either composed form is acceptable here.
+            let bare = desc.name().to_string();
+            if CABLE_RE.is_match(&composed) || CABLE_RE.is_match(&bare) {
+                Some((d, composed))
             } else {
                 None
             }

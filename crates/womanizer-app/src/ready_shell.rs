@@ -155,6 +155,41 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
         }
     });
 
+    ui.horizontal(|ui| {
+        ui.label("Monitor (headphones):");
+        let outputs = enumerate_outputs();
+        let current = state
+            .selected_monitor
+            .clone()
+            .unwrap_or_else(|| "(host default)".to_string());
+        let mut new_pick: Option<Option<String>> = None;
+        egui::ComboBox::from_id_salt("ready-monitor-pick")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.selected_monitor.is_none(), "(host default)")
+                    .clicked()
+                {
+                    new_pick = Some(None);
+                }
+                for name in &outputs {
+                    if ui
+                        .selectable_label(
+                            state.selected_monitor.as_deref() == Some(name.as_str()),
+                            name,
+                        )
+                        .clicked()
+                    {
+                        new_pick = Some(Some(name.clone()));
+                    }
+                }
+            });
+        if let Some(p) = new_pick {
+            state.selected_monitor = p.clone();
+            let _ = state.handle.cmd_tx.send(EngineCommand::SetMonitor(p));
+        }
+    });
+
     // -------- Monitor checkbox (D-12 verbatim inline label) --------
     let mut mon = state.handle.hot.monitor_enabled.load(Ordering::Relaxed);
     if ui

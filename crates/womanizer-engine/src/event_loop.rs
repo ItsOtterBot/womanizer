@@ -76,6 +76,11 @@ pub struct EngineState {
     /// `default_output_device()` (a sensible fallback only for development; the real
     /// product flow always selects the virtual device by name).
     pub selected_virtual_output: Option<String>,
+    /// Last-selected monitor (headphones) device name for the self-monitor stream (D-12).
+    /// `None` → use `default_output_device()`. If the monitor stream fails to build, the
+    /// engine logs a warning and continues without monitor — the mic → virtual-output path
+    /// is unaffected.
+    pub selected_monitor: Option<String>,
 }
 
 /// Public handle the UI consumes. The UI side sends [`EngineCommand`]s on `cmd_tx` and
@@ -213,6 +218,14 @@ impl Engine {
                         self.handle_start();
                     }
                 }
+                Ok(EngineCommand::SetMonitor(name)) => {
+                    tracing::info!(?name, "SetMonitor received");
+                    self.state.selected_monitor = name;
+                    if self.streams.is_some() {
+                        self.handle_stop_silent();
+                        self.handle_start();
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     self.drain_error_ring();
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms
@@ -314,12 +327,10 @@ impl Engine {
         // ---- construct rings + atomics BEFORE build_*_stream (RESEARCH Pitfall #Y) ----
         let (in_tx, in_rx): InputRing = RingBuffer::new(RING_CAPACITY);
         let (vo_tx, vo_rx): VirtualOutRing = RingBuffer::new(RING_CAPACITY);
-        // mo_rx is dropped here in Phase 1 — Plan 01-03's monitor stream constructor will
-        // take ownership of the Consumer half when the user picks a monitor device (the
-        // wiring is Plan 01-05's W8 follow-up). Dropping is safe: once the consumer is
-        // gone, the worker's `let _ = mo_tx.push_entire_slice(...)` becomes a no-op (rtrb
-        // push returns Err(Full) once the consumer disappears; the worker discards).
-        let (mo_tx, _mo_rx): MonitorOutRing = RingBuffer::new(RING_CAPACITY);
+        // mo_rx is moved into the monitor stream constructor below. If the monitor stream
+        // fails to build (e.g. user's monitor device is busy), we drop mo_rx — the worker's
+        // `mo_tx.push_entire_slice(...)` calls become no-ops once the consumer disappears.
+        let (mo_tx, mo_rx): MonitorOutRing = RingBuffer::new(RING_CAPACITY);
 
         let (ts_tx, ts_rx): (Producer<TimestampPair>, Consumer<TimestampPair>) =
             RingBuffer::new(TS_RING_CAPACITY);
@@ -410,9 +421,53 @@ impl Engine {
             ts_rx,
             self.tele.clone(),
             vout_err_tx,
-            engine_wake,
+            engine_wake.clone(),
         )
         .map_err(EngineBootError::BuildVirtualOut)?;
+
+        // ---- monitor (headphones) stream — non-fatal. Resolves the selected_monitor device
+        // (falling back to host default), tries to build, logs + drops `mo_rx` on failure. ----
+        let monitor_stream = {
+            let device = match &self.state.selected_monitor {
+                Some(name) => find_output_device_by_name(&host, name).or_else(|| {
+                    tracing::warn!(
+                        name = %name,
+                        "selected monitor device not found; falling back to default_output_device"
+                    );
+                    host.default_output_device()
+                }),
+                None => host.default_output_device(),
+            };
+            match device {
+                Some(dev) => {
+                    // Build a dedicated ErrorRing for the monitor stream so its faults don't
+                    // mix into the capture / vout rings.
+                    let (mon_err_tx, _mon_err_rx) = ErrorRing::new(32);
+                    match crate::monitor::build_monitor_output_stream(
+                        &dev,
+                        mo_rx,
+                        self.hot.clone(),
+                        self.tele.clone(),
+                        mon_err_tx,
+                        engine_wake,
+                    ) {
+                        Ok(s) => {
+                            tracing::info!("monitor stream built");
+                            Some(s)
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "monitor stream build failed; continuing without self-monitor");
+                            None
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("no monitor device available; continuing without self-monitor");
+                    drop(mo_rx);
+                    None
+                }
+            }
+        };
 
         // ---- W8 wiring: instantiate the FeedbackDetector now that tele / hot / banner
         // are live and the streams that drive `Telemetry::input_rms` are about to run. ----
@@ -437,6 +492,7 @@ impl Engine {
         self.streams = Some(EngineStreams {
             input: input_stream,
             virtual_out: vout_stream,
+            monitor: monitor_stream,
         });
         self.worker = Some(worker);
         self.capture_err_rx = Some(capture_err_rx);
@@ -555,22 +611,27 @@ enum EngineBootError {
     SpawnWorker(std::io::Error),
 }
 
-/// Look up an input device by user-visible name. Returns `None` if no match (caller falls
-/// back to the host default + warns).
+/// Look up an input device by user-visible name. The name is the composed `"endpoint (driver)"`
+/// form produced by `cpal_io::enumerate_inputs`; falls back to a bare-name match (for legacy
+/// settings rows written before the composed-name change). Returns `None` if no match.
 fn find_input_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     use cpal::traits::{DeviceTrait, HostTrait};
-    host.input_devices()
-        .ok()?
-        .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
+    cpal_io::match_input_device_by_composed_name(host, name).or_else(|| {
+        host.input_devices()
+            .ok()?
+            .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
+    })
 }
 
 /// Look up an output device by user-visible name. Same fallback contract as
 /// `find_input_device_by_name`.
 fn find_output_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     use cpal::traits::{DeviceTrait, HostTrait};
-    host.output_devices()
-        .ok()?
-        .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
+    cpal_io::match_output_device_by_composed_name(host, name).or_else(|| {
+        host.output_devices()
+            .ok()?
+            .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
+    })
 }
 
 /// Public spawner: creates the cmd/evt channels, constructs the engine struct, spawns the
