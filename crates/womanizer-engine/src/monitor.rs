@@ -28,7 +28,15 @@
 //! leaves the marker comment) are owned by Plan 01-05 (Wave 4). This plan does NOT touch
 //! event_loop.rs.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// Diagnostic counters for the monitor callback. Bumped from the RT path with `Relaxed`
+// (no allocation, no syscall — Relaxed atomic adds are safe in `assert_no_alloc`). Read
+// from the event loop's 1-Hz snapshot. To be removed once the audio chain is confirmed
+// working end-to-end.
+pub static DIAG_MONITOR_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+pub static DIAG_MONITOR_DRAIN: AtomicUsize = AtomicUsize::new(0);
+pub static DIAG_MONITOR_UNDERRUN: AtomicUsize = AtomicUsize::new(0);
 use std::sync::Arc;
 
 use assert_no_alloc::assert_no_alloc;
@@ -225,6 +233,7 @@ pub fn build_monitor_output_stream(
         &requested,
         move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
             assert_no_alloc(|| {
+                DIAG_MONITOR_CALLBACK.fetch_add(1, Ordering::Relaxed);
                 // Monitor-off short-circuit (D-12 default + D-14 post-trip). Fill silence
                 // cheaply and skip the ring drain entirely. The Relaxed load is fine because
                 // the UI toggle's overwrite-latest semantics already accept up to one
@@ -246,10 +255,12 @@ pub fn build_monitor_output_stream(
                                 out[i * 2 + 1] = *s;
                             }
                             chunk.commit_all();
+                            DIAG_MONITOR_DRAIN.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
                             out.fill(0.0);
                             tele.xruns.fetch_add(1, Ordering::Relaxed);
+                            DIAG_MONITOR_UNDERRUN.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 } else {
@@ -260,10 +271,12 @@ pub fn build_monitor_output_stream(
                             out[..a.len()].copy_from_slice(a);
                             out[a.len()..a.len() + b.len()].copy_from_slice(b);
                             chunk.commit_all();
+                            DIAG_MONITOR_DRAIN.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
                             out.fill(0.0);
                             tele.xruns.fetch_add(1, Ordering::Relaxed);
+                            DIAG_MONITOR_UNDERRUN.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }

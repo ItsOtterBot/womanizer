@@ -48,6 +48,13 @@ use womanizer_core::{AudioFrame, HotParams, VoiceParams};
 // The actual type lives in `womanizer-core::wake` (Phase 0 contract).
 pub use womanizer_core::DspWakeHandle;
 
+// Diagnostic counters — bumped from the worker side, read from the event loop's 1-Hz
+// snapshot. Process-wide (single engine at a time). To be removed once the audio chain
+// is confirmed working end-to-end on Andrew's Windows host.
+pub static DIAG_DSP_WAKES: AtomicUsize = AtomicUsize::new(0);
+pub static DIAG_DSP_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+pub static DIAG_MO_WRITES: AtomicUsize = AtomicUsize::new(0);
+
 use crate::cpal_io::BLOCK;
 
 /// Sleep cadence for the capture-pump thread between samples_since_wake checks.
@@ -140,6 +147,7 @@ pub fn spawn_dsp_worker(
                 // Park until the capture-pump signals us. Acquire-orders any samples pushed
                 // into InputRing before the wake() so they are visible after wait() returns.
                 wake.wait();
+                DIAG_DSP_WAKES.fetch_add(1, Ordering::Relaxed);
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
                 }
@@ -151,6 +159,7 @@ pub fn spawn_dsp_worker(
                     scratch[..a.len()].copy_from_slice(a);
                     scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
                     chunk.commit_all();
+                    DIAG_DSP_CHUNKS.fetch_add(1, Ordering::Relaxed);
 
                     // Phase 1: memcpy passthrough (smoke.rs lines 48-53 verbatim shape).
                     // The whole DSP body stays inside assert_no_alloc so any future
@@ -167,6 +176,7 @@ pub fn spawn_dsp_worker(
                     let _ = vo_tx.push_entire_slice(&processed);
                     if hot.monitor_enabled.load(Ordering::Relaxed) {
                         let _ = mo_tx.push_entire_slice(&processed);
+                        DIAG_MO_WRITES.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
