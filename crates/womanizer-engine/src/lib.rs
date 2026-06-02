@@ -20,6 +20,7 @@
 
 pub mod cpal_io;
 pub mod devices;
+pub mod dsp;
 pub mod event_loop;
 pub mod monitor;
 pub mod resampler;
@@ -39,6 +40,11 @@ pub use event_loop::{spawn as spawn_engine, EngineHandle, EngineState};
 // Re-export the cpal-side UI surface: device enumeration for the Ready shell's input row
 // (AUDIO-01), the BLOCK / SAMPLE_RATE_HZ engine constants for any UI surface that needs them.
 pub use cpal_io::{enumerate_inputs, enumerate_outputs, BLOCK, SAMPLE_RATE_HZ};
+
+// Re-export the DSP Preset enum (D-26 segmented-row variants) so the Ready shell (Plan
+// 02-08) can `use womanizer_engine::Preset` without reaching into the `dsp` module — same
+// pattern Phase 1 uses for `EngineHandle` / `DetectionResult` / `MonitorBannerState`.
+pub use dsp::Preset;
 
 // Re-export the banner-state publishers and verbatim copy constants that Plan 01-05's
 // Ready shell consumes for the three yellow banners (AUDIO-04 sample-rate-mismatch,
