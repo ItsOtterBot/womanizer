@@ -34,6 +34,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
+# Phase 2 (Plan 02-01) DSP additions — wired by the dsp.rs module skeleton in this plan
+# and consumed by the worker loop body in plans 02-04..02-07. Versions are pinned ONCE in
+# the workspace manifest (signalsmith-stretch = "= 0.1.3" exact-pin per Pitfall 2).
+signalsmith-stretch = { workspace = true }
+wide = { workspace = true }
+pitch-detection = { workspace = true }
+
 # regex is consumed ONLY by the Windows VB-CABLE detection module (devices/windows.rs)
 # per D-19; cfg-gate it so non-Windows builds stay lean.
 [target.'cfg(target_os = "windows")'.dependencies]
