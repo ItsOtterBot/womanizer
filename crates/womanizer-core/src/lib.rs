@@ -24,7 +24,7 @@ pub mod wake;
 pub use error_ring::{EngineError, ErrorRing};
 pub use params::{semitones_to_ratio, QualityPreset, VoiceParams};
 pub use primitives::{
-    AudioFrame, EngineCommand, EngineEvent, HotParams, InputRing, MonitorOutRing, Telemetry,
-    VirtualOutRing, RING_CAPACITY,
+    AudioFrame, EngineCommand, EngineEvent, HotParams, InputRing, MonitorOutRing, Preset,
+    Telemetry, VirtualOutRing, RING_CAPACITY,
 };
 pub use wake::DspWakeHandle;

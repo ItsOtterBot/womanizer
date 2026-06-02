@@ -309,6 +309,15 @@ impl Engine {
                         self.handle_start();
                     }
                 }
+                Ok(EngineCommand::SetPreset(preset)) => {
+                    // Phase 2 Plan 02-08 wires this to: construct a fresh `Stretch48k` off-RT
+                    // here on the event-loop thread, then hand it to the DSP worker via a
+                    // `crossbeam_channel::bounded::<Stretch48k>(1)` swap channel (RESEARCH §Q9
+                    // — signalsmith-stretch has no in-place reconfigure). Plan 02-02 only
+                    // widens the EngineCommand enum and lands this match arm as a tracing
+                    // log so the build stays exhaustive.
+                    tracing::debug!(?preset, "SetPreset received (Plan 02-08 wiring placeholder)");
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms
                     // cadence as the ErrorRing drain. The detector is only present while
@@ -911,6 +920,8 @@ mod tests {
             latency_ms: atomic_float::AtomicF32::new(0.0),
             input_rms: atomic_float::AtomicF32::new(0.0),
             xruns: std::sync::atomic::AtomicU32::new(0),
+            input_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
+            output_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
         });
         let handle = spawn(EngineState::default(), hot, tele);
         // Stop is idempotent — engine is in Stopped state already, so no event fires.
@@ -948,6 +959,8 @@ mod tests {
             latency_ms: atomic_float::AtomicF32::new(0.0),
             input_rms: atomic_float::AtomicF32::new(0.0),
             xruns: std::sync::atomic::AtomicU32::new(0),
+            input_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
+            output_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
         });
         let handle = spawn(EngineState::default(), hot, tele);
 

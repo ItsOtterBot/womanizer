@@ -9,8 +9,10 @@
 //!
 //! ## What lives here
 //! - [`Preset`]: three-variant quality enum (Low / Balanced / Quality) per D-26 + RESEARCH §Q2.
-//!   `Preset::window_hop()` returns the STFT `(block_length, interval)` pair that fits each
-//!   latency budget. Starting points; execute-time A/B may tighten Quality (D-25).
+//!   Defined in `womanizer-core::primitives` as of Plan 02-02 (so `EngineCommand::SetPreset(Preset)`
+//!   can reference it without a circular crate dep — Pattern G); re-exported here for ergonomic
+//!   `use crate::dsp::Preset`. [`preset_window_hop`] returns the STFT `(block_length, interval)`
+//!   pair that fits each latency budget. Starting points; execute-time A/B may tighten Quality (D-25).
 //! - [`Stretch48k`]: wrapper around `signalsmith_stretch::Stretch` with the preset
 //!   stashed. Constructed off-RT; `process(&[f32], &mut [f32])` is the per-block hot path.
 //!   `set_transpose(m)` / `set_formant(m)` adopt D-24's locked `compensate_pitch = true` so
@@ -52,40 +54,34 @@ use signalsmith_stretch::Stretch;
 
 use crate::cpal_io::{BLOCK, SAMPLE_RATE_HZ};
 
+// Phase 2 Plan 02-02 moved the canonical `Preset` definition into `womanizer-core::primitives`
+// so the new `EngineCommand::SetPreset(Preset)` variant can reference it without a circular
+// crate dep (Pattern G / PATTERNS.md decision (a)). Inherent impls must live on the
+// defining crate's type, so `Preset::window_hop` becomes the free function
+// `preset_window_hop` below.
+pub use womanizer_core::Preset;
+
 /// Engine-wide sample rate constant re-exported for callers who want a single import. Equal
 /// to [`SAMPLE_RATE_HZ`] from `cpal_io` — 48 kHz, fixed (D-05). The duplicate lives here so
 /// dsp.rs is self-contained as a module surface; both constants resolve to the same value.
 pub const ENGINE_SR: u32 = SAMPLE_RATE_HZ;
 
-/// Three quality presets exposed in the Ready shell's segmented row (D-26). Each maps to a
-/// distinct STFT `(block_length, interval)` pair that fits the latency budget for its tier
-/// (D-25 — Low <32 ms, Balanced <40 ms, Quality <50 ms total round-trip).
+/// Return the `(block_length, interval)` STFT window/hop pair for the given preset.
 ///
-/// Derived `Copy + Clone + Debug + Eq + PartialEq` so the future `EngineCommand::SetPreset(Preset)`
-/// variant (Plan 02-08) inherits its `#[derive]`s without friction.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Preset {
-    /// <32 ms total round-trip target. STFT (1024, 256) starting point per RESEARCH §Q2.
-    Low,
-    /// <40 ms total round-trip target. STFT (2048, 512) starting point per RESEARCH §Q2.
-    Balanced,
-    /// <50 ms total round-trip target. STFT (3072, 768) starting point per RESEARCH §Q2.
-    Quality,
-}
-
-impl Preset {
-    /// Return the `(block_length, interval)` STFT window/hop pair for this preset.
-    ///
-    /// 4:1 block-to-hop ratio matches the upstream `presetDefault` overlap and is the
-    /// phase-vocoder sweet spot for quality. These are STARTING POINTS — the execute-time
-    /// A/B sprint in Plan 02-04 may tighten Quality (D-25 — quality-validate after the
-    /// latency budget is met).
-    pub fn window_hop(self) -> (usize, usize) {
-        match self {
-            Preset::Low => (1024, 256),
-            Preset::Balanced => (2048, 512),
-            Preset::Quality => (3072, 768),
-        }
+/// 4:1 block-to-hop ratio matches the upstream `presetDefault` overlap and is the
+/// phase-vocoder sweet spot for quality. These are STARTING POINTS — the execute-time
+/// A/B sprint in Plan 02-04 may tighten Quality (D-25 — quality-validate after the
+/// latency budget is met).
+///
+/// Free function rather than `Preset::window_hop` because [`Preset`] is defined in
+/// `womanizer-core::primitives` (Plan 02-02; Pattern G — fields/types that cross thread
+/// boundaries live there so [`EngineCommand::SetPreset`] can reference Preset without a
+/// circular crate dep). Rust requires inherent impls to live on the defining crate's type.
+pub fn preset_window_hop(preset: Preset) -> (usize, usize) {
+    match preset {
+        Preset::Low => (1024, 256),
+        Preset::Balanced => (2048, 512),
+        Preset::Quality => (3072, 768),
     }
 }
 
@@ -117,13 +113,13 @@ pub struct Stretch48k {
 impl Stretch48k {
     /// Construct a new Stretch instance for the given preset. Calls
     /// `signalsmith_stretch::Stretch::new(1, block_length, interval)` with the
-    /// preset's STFT pair from [`Preset::window_hop`].
+    /// preset's STFT pair from [`preset_window_hop`].
     ///
     /// CRITICAL: MUST be called off the audio thread. The upstream constructor performs
     /// the one-time C++ buffer allocation; calling it from inside `assert_no_alloc(|| ...)`
     /// would trip the debug-build allocation counter.
     pub fn new(preset: Preset) -> Self {
-        let (block_length, interval) = preset.window_hop();
+        let (block_length, interval) = preset_window_hop(preset);
         let inner = Stretch::new(1u32, block_length, interval);
         Self { inner, preset }
     }
@@ -396,11 +392,11 @@ mod tests {
 
     /// Smoke test that the locked Preset → (window, hop) pairs match RESEARCH §Q2.
     /// If Plan 02-04's A/B sprint tightens any of these, update this assertion in
-    /// lock-step with the `Preset::window_hop` body.
+    /// lock-step with the [`preset_window_hop`] body.
     #[test]
     fn preset_window_hop_pairs_match_research() {
-        assert_eq!(Preset::Low.window_hop(), (1024, 256));
-        assert_eq!(Preset::Balanced.window_hop(), (2048, 512));
-        assert_eq!(Preset::Quality.window_hop(), (3072, 768));
+        assert_eq!(preset_window_hop(Preset::Low), (1024, 256));
+        assert_eq!(preset_window_hop(Preset::Balanced), (2048, 512));
+        assert_eq!(preset_window_hop(Preset::Quality), (3072, 768));
     }
 }

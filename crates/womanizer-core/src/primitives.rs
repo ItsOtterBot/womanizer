@@ -56,6 +56,30 @@ pub struct Telemetry {
     pub input_rms: AtomicF32,
     /// Cumulative buffer underrun/overrun (xrun) count.
     pub xruns: AtomicU32,
+    /// Input fundamental frequency in Hz (post-YIN). `f32::NAN` when unvoiced. Written by the
+    /// DSP worker at ~30 Hz; read by the UI each repaint. Phase 2 (D-32). Added by Phase 2
+    /// Plan 02-02 as a cross-phase contract widening (Pattern G — fields that cross thread
+    /// boundaries live in `womanizer-core/src/primitives.rs`).
+    pub input_f0_hz: AtomicF32,
+    /// Output fundamental in Hz (input_f0 * smoothed pitch ratio). `f32::NAN` when input is
+    /// unvoiced. Written by the DSP worker at ~30 Hz; read by the UI each repaint. Phase 2
+    /// (D-32). Added by Phase 2 Plan 02-02 as a cross-phase contract widening (Pattern G —
+    /// fields that cross thread boundaries live in `womanizer-core/src/primitives.rs`).
+    pub output_f0_hz: AtomicF32,
+}
+
+/// Three quality-vs-latency presets exposed in the Ready shell (D-26). Low <32 ms,
+/// Balanced <40 ms, Quality <50 ms total round-trip target (D-25/D-26). Lives in
+/// `womanizer-core` (rather than `womanizer-engine::dsp`) so [`EngineCommand::SetPreset`]
+/// can reference it without a circular crate dep (Pattern G / PATTERNS.md decision (a)).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Preset {
+    /// <32 ms total round-trip target.
+    Low,
+    /// <40 ms total round-trip target.
+    Balanced,
+    /// <50 ms total round-trip target.
+    Quality,
 }
 
 /// Discrete commands from the UI to the engine. **Off-audio-thread only** — sent over
@@ -77,6 +101,14 @@ pub enum EngineCommand {
     /// Set the monitor (headphones) device by name. Same semantics as [`Self::SetInput`].
     /// Monitor failures are non-fatal — the mic → virtual-output path continues regardless.
     SetMonitor(Option<String>),
+    /// Switch the active quality preset (D-26 segmented row). Handled OFF the RT path:
+    /// `signalsmith-stretch` exposes no in-place reconfigure, so the engine event loop
+    /// constructs a fresh `Stretch48k` off-RT and hands it to the DSP worker via a
+    /// `crossbeam_channel::bounded<Stretch48k>(1)` swap channel (RESEARCH §Q9). The worker
+    /// drains the channel between blocks and swaps the instance in. Added by Phase 2 Plan
+    /// 02-02 as a cross-phase contract widening (Pattern D — append at end, preserve derive
+    /// order so the existing `#[derive(Debug, Clone, PartialEq, Eq)]` covers this variant).
+    SetPreset(Preset),
 }
 
 /// Discrete events from the engine to the UI. **Off-audio-thread only.**

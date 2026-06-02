@@ -44,7 +44,11 @@ pub use cpal_io::{enumerate_inputs, enumerate_outputs, BLOCK, SAMPLE_RATE_HZ};
 // Re-export the DSP Preset enum (D-26 segmented-row variants) so the Ready shell (Plan
 // 02-08) can `use womanizer_engine::Preset` without reaching into the `dsp` module — same
 // pattern Phase 1 uses for `EngineHandle` / `DetectionResult` / `MonitorBannerState`.
-pub use dsp::Preset;
+// As of Plan 02-02 the canonical definition lives in `womanizer-core::primitives` so the
+// new `EngineCommand::SetPreset(Preset)` variant can reference it without a circular crate
+// dep (Pattern G). This re-export's downstream-facing path (`womanizer_engine::Preset`) is
+// unchanged — `dsp::Preset` is itself a `pub use womanizer_core::Preset`.
+pub use womanizer_core::Preset;
 
 // Re-export the banner-state publishers and verbatim copy constants that Plan 01-05's
 // Ready shell consumes for the three yellow banners (AUDIO-04 sample-rate-mismatch,

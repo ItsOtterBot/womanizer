@@ -431,6 +431,8 @@ mod tests {
             latency_ms: AtomicF32::new(0.0),
             input_rms: AtomicF32::new(0.0),
             xruns: AtomicU32::new(0),
+            input_f0_hz: AtomicF32::new(f32::NAN),
+            output_f0_hz: AtomicF32::new(f32::NAN),
         });
         let hot = Arc::new(HotParams {
             input_gain: AtomicF32::new(1.0),
