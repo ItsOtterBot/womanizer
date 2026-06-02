@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use womanizer_engine::{
     spawn_engine, DetectionResult, EngineEvent, EngineHandle, EngineState, MonitorBannerState,
-    SampleRateState,
+    Preset, SampleRateState,
 };
 
 /// The top-level app state. Either we're behind the setup gate, or we've cleared it and the
@@ -119,6 +119,21 @@ pub struct ReadyState {
     /// self-monitor stream). Same semantics as [`Self::selected_input`]. Monitor failures
     /// are non-fatal — `None` here means "use the host default output".
     pub selected_monitor: Option<String>,
+    /// Phase 2 (Plan 02-08, D-22 / D-23) UI mirror of the active pitch multiplier. Range
+    /// `1.20..=2.00` (D-23 conservative M→F sweet spot ± safety margin). Default `1.65×`
+    /// (D-22, seeded from `VoiceParams::default()` semitones via `2^(st/12)`). On slider
+    /// drag the new value is stored here and `publish_voice_params` writes a fresh
+    /// `VoiceParams` snapshot to the DSP worker via `handle.snap_in`.
+    pub pitch_slider: f32,
+    /// Phase 2 (Plan 02-08, D-22 / D-23) UI mirror of the active formant multiplier. Range
+    /// `1.00..=1.40` (D-23). Default `1.18×` (D-22).
+    pub formant_slider: f32,
+    /// Phase 2 (Plan 02-08, D-26) UI mirror of the active quality preset. Default
+    /// [`Preset::Balanced`] (matches the ROADMAP's "Balanced default" and the worker's
+    /// boot-time `Stretch48k::new(Preset::Balanced)`). On click the UI sends
+    /// `EngineCommand::SetPreset(p)` over `cmd_tx`; the off-RT rebuild handler that
+    /// actually swaps the warm `Stretch48k` instance lands in Plan 02-09.
+    pub current_preset: Preset,
 }
 
 impl ReadyState {
@@ -130,6 +145,11 @@ impl ReadyState {
     ) -> Self {
         let monitor_banner = handle.monitor_banner.clone();
         let sample_rate_state = handle.sample_rate_state.clone();
+        // Seed slider mirrors from VoiceParams::default() so the UI ratio matches the worker's
+        // boot-time semitones (D-22 — pitch ~8.7 st → ~1.65×; formant ~2.9 st → ~1.18×).
+        let defaults = womanizer_core::VoiceParams::default();
+        let pitch_slider = womanizer_core::semitones_to_ratio(defaults.pitch_semitones);
+        let formant_slider = womanizer_core::semitones_to_ratio(defaults.formant_semitones);
         Self {
             handle,
             sample_rate_state,
@@ -138,7 +158,30 @@ impl ReadyState {
             selected_input,
             selected_vout,
             selected_monitor,
+            pitch_slider,
+            formant_slider,
+            current_preset: Preset::Balanced,
         }
+    }
+
+    /// Phase 2 (Plan 02-08, D-23 + D-35): push the current slider mirror values to the DSP
+    /// worker via the lock-free `triple_buffer<VoiceParams>` writer on `EngineHandle`.
+    /// Called on every slider on-change event so drags publish at the egui repaint cadence
+    /// (≥ 30 Hz); the worker's [`SmoothedVoiceParams`] interpolator handles the 30 ms
+    /// exponential ramp (D-35) so audible zipper noise is avoided.
+    ///
+    /// Pitch / formant mirror values are ratios (the slider ranges are ratios per D-23);
+    /// `VoiceParams` stores semitones (D-04), so we round-trip via `12 * log2(ratio)`.
+    /// All other `VoiceParams` fields stay at their `Default` values for Phase 2 — Phase 4
+    /// adds the editor UI that lets the user edit breathiness / brightness / sibilance /
+    /// mix; Phase 2 only exposes pitch + formant.
+    pub fn publish_voice_params(&self) {
+        let params = womanizer_core::VoiceParams {
+            pitch_semitones: 12.0 * self.pitch_slider.log2(),
+            formant_semitones: 12.0 * self.formant_slider.log2(),
+            ..womanizer_core::VoiceParams::default()
+        };
+        self.handle.publish_voice_params(params);
     }
 }
 

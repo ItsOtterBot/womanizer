@@ -1,4 +1,5 @@
-//! Ready shell — the minimal Phase 1 engine surface (AUDIO-04 / 06 / 08 / 09 + D-12 monitor).
+//! Ready shell — engine surface for Phase 1 (AUDIO-04 / 06 / 08 / 09 + D-12 monitor) plus
+//! the Phase 2 (Plan 02-08) pitch / formant / preset / F0 readout additions.
 //!
 //! Renders, in vertical order:
 //! 1. Three banner blocks (each gated on its predicate):
@@ -6,19 +7,26 @@
 //!    - Feedback-detected (AUDIO-08, D-14 verbatim copy + `×` dismiss).
 //!    - Disconnect (AUDIO-09, D-07 verbatim copy + click-to-reconnect button).
 //! 2. App header + device row (input device name from `enumerate_inputs`).
-//! 3. Monitor checkbox (D-12 default OFF; inline label verbatim "Self-monitor (headphones only)").
-//! 4. Start / Stop horizontal row → sends `EngineCommand::Start` / `Stop` on `cmd_tx`.
-//! 5. Live meters: latency_ms, input_rms, xruns — all read at the 30 Hz repaint cadence.
+//! 3. Device pickers (input mic, virtual output, monitor).
+//! 4. Monitor checkbox (D-12 default OFF; inline label verbatim "Self-monitor (headphones only)").
+//! 5. Phase 2: pitch slider (`1.20..=2.00`) + formant slider (`1.00..=1.40`) — D-23 + D-35;
+//!    slider on-change publishes via `state.publish_voice_params()` → `EngineHandle::snap_in`.
+//! 6. Start / Stop horizontal row → sends `EngineCommand::Start` / `Stop` on `cmd_tx`.
+//! 7. Phase 2: three-button preset row (`[Low latency] [Balanced] [Quality]`) — D-26;
+//!    clicks send `EngineCommand::SetPreset(p)` over `cmd_tx`.
+//! 8. Live meters: latency_ms, input_rms, xruns — all read at the 30 Hz repaint cadence.
+//! 9. Phase 2: F0 readout (`Pitch: <input_hz> → <output_hz>`) — D-32 + D-33; renders
+//!    "—" when YIN reports unvoiced (NaN sentinel).
 //!
-//! Phase 4 will add the input/virtual-output/monitor device dropdowns + the voice library
-//! editor; this is the Phase 1 minimal surface that lets the developer (and the manual
-//! checkpoint verifier) prove the end-to-end mic → virtual device → VRChat path works.
+//! Phase 4 will add the voice library editor; this is the minimal surface that lets the
+//! developer (and the manual checkpoint verifier) prove the end-to-end mic → virtual device
+//! → VRChat path works with the Phase 2 DSP affordances.
 
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
 use womanizer_engine::{
-    enumerate_inputs, enumerate_outputs, render_resample_banner, EngineCommand,
+    enumerate_inputs, enumerate_outputs, render_resample_banner, EngineCommand, Preset,
     DISCONNECT_BANNER_COPY, FEEDBACK_BANNER_COPY,
 };
 
@@ -200,6 +208,37 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
             .store(mon, Ordering::Relaxed);
     }
 
+    // -------- Phase 2 Plan 02-08 INSERTION 1: pitch + formant sliders (above Start/Stop) --
+    //
+    // Slider on-change publishes via `state.publish_voice_params()` which writes a fresh
+    // `VoiceParams` snapshot through `EngineHandle::snap_in` (triple_buffer Input). This is
+    // a high-frequency parameter stream per Pattern E — slider drags MUST NOT route through
+    // `cmd_tx` (the bounded channel discipline; cmd_tx is for discrete commands only).
+    // Ranges are conservative M→F sweet spot per D-23; SmoothedVoiceParams (30 ms ramp, D-35)
+    // on the worker side prevents zipper noise (CONTEXT Pitfall #7 mitigation).
+    ui.horizontal(|ui| {
+        ui.label("Pitch:");
+        let mut pitch = state.pitch_slider;
+        if ui
+            .add(egui::Slider::new(&mut pitch, 1.20..=2.00).text("×"))
+            .changed()
+        {
+            state.pitch_slider = pitch;
+            state.publish_voice_params();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Formant:");
+        let mut formant = state.formant_slider;
+        if ui
+            .add(egui::Slider::new(&mut formant, 1.00..=1.40).text("×"))
+            .changed()
+        {
+            state.formant_slider = formant;
+            state.publish_voice_params();
+        }
+    });
+
     // -------- Start / Stop row --------
     ui.horizontal(|ui| {
         if ui.button("Start").clicked() {
@@ -207,6 +246,29 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
         }
         if ui.button("Stop").clicked() {
             let _ = state.handle.cmd_tx.send(EngineCommand::Stop);
+        }
+    });
+
+    // -------- Phase 2 Plan 02-08 INSERTION 2: preset segmented row (below Start/Stop) ------
+    //
+    // Three-button segmented row per D-26 verbatim copy ("Low latency" / "Balanced" /
+    // "Quality"). Clicks send `EngineCommand::SetPreset(p)` over `cmd_tx` (discrete command,
+    // off-RT path) — the engine event-loop's SetPreset handler (Plan 02-09) constructs a
+    // fresh `Stretch48k` off-RT and hands it to the DSP worker via a bounded swap channel.
+    // The current selection is highlighted via egui's `SelectableLabel` state.
+    ui.horizontal(|ui| {
+        for (preset, label) in [
+            (Preset::Low, "Low latency"),
+            (Preset::Balanced, "Balanced"),
+            (Preset::Quality, "Quality"),
+        ] {
+            if ui
+                .selectable_label(state.current_preset == preset, label)
+                .clicked()
+            {
+                state.current_preset = preset;
+                let _ = state.handle.cmd_tx.send(EngineCommand::SetPreset(preset));
+            }
         }
     });
 
@@ -222,5 +284,25 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.label(format!(
         "Xruns: {}",
         state.handle.tele.xruns.load(Ordering::Relaxed)
+    ));
+
+    // -------- Phase 2 Plan 02-08 INSERTION 3: F0 readout (below Xruns) -------------------
+    //
+    // D-33 verbatim copy "Pitch: <input> → <output>" — input + output F0 in Hz. The
+    // DSP worker writes `Telemetry::input_f0_hz` / `output_f0_hz` at ~30 Hz from YIN
+    // (Plan 02-06); read each repaint with Relaxed ordering. D-32 unvoiced sentinel:
+    // YIN reports NaN when no confident pitch is detected → render "—" not "0 Hz" (0 Hz
+    // is physically nonsensical for a human voice; "—" is the user-facing convention).
+    let fmt_hz = |hz: f32| -> String {
+        if hz.is_nan() {
+            "—".to_string()
+        } else {
+            format!("{hz:.0} Hz")
+        }
+    };
+    ui.label(format!(
+        "Pitch: {} → {}",
+        fmt_hz(state.handle.tele.input_f0_hz.load(Ordering::Relaxed)),
+        fmt_hz(state.handle.tele.output_f0_hz.load(Ordering::Relaxed)),
     ));
 }
