@@ -50,6 +50,8 @@ fn cpal_callback_shapes_pass_assert_no_alloc() {
         latency_ms: atomic_float::AtomicF32::new(0.0),
         input_rms: atomic_float::AtomicF32::new(0.0),
         xruns: AtomicU32::new(0),
+        input_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
+        output_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
     });
 
     // HotParams — read only by the worker in production, present here for surface-area

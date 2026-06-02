@@ -316,7 +316,10 @@ impl Engine {
                     // — signalsmith-stretch has no in-place reconfigure). Plan 02-02 only
                     // widens the EngineCommand enum and lands this match arm as a tracing
                     // log so the build stays exhaustive.
-                    tracing::debug!(?preset, "SetPreset received (Plan 02-08 wiring placeholder)");
+                    tracing::debug!(
+                        ?preset,
+                        "SetPreset received (Plan 02-08 wiring placeholder)"
+                    );
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms

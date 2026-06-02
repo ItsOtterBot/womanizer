@@ -39,6 +39,8 @@ fn error_ring_drain_emits_engine_event_then_rebuild() {
         latency_ms: atomic_float::AtomicF32::new(0.0),
         input_rms: atomic_float::AtomicF32::new(0.0),
         xruns: std::sync::atomic::AtomicU32::new(0),
+        input_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
+        output_f0_hz: atomic_float::AtomicF32::new(f32::NAN),
     });
     let handle = spawn_engine(EngineState::default(), hot, tele);
 
