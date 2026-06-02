@@ -409,11 +409,16 @@ pub fn build_capture_stream(
     let block_seq = Arc::new(AtomicU64::new(0));
     let block_seq_cb = block_seq.clone();
 
-    // Max frames per callback we'll downmix in a single pass. The buffer-size request is
-    // Fixed(BLOCK); some backends round up. 4*BLOCK = 1024 frames = 4 KB on the stack is a
-    // generous ceiling for any plausible cpal callback grouping. If a backend exceeds this,
-    // we truncate (the assertion below is allocation-free).
-    const MONO_BUF_LEN: usize = BLOCK * 4;
+    // Heap-allocated downmix buffer, sized from the cpal-reported buffer-size ceiling so we
+    // never silently truncate frames when a Windows shared-mode device hands us a buffer
+    // larger than the small stack ceiling we used to pin. Allocated once at stream-build
+    // time (off the audio thread); the closure captures ownership and reuses it for every
+    // callback — zero heap allocation inside the RT region (CR-01 fix).
+    let max_frames: usize = match supported.buffer_size() {
+        SupportedBufferSize::Range { max, .. } => (*max as usize).max(BLOCK * 4),
+        SupportedBufferSize::Unknown => BLOCK * 16,
+    };
+    let mut mono_scratch: Vec<f32> = vec![0.0; max_frames];
 
     let stream = device.build_input_stream::<f32, _, _>(
         &requested,
@@ -421,8 +426,8 @@ pub fn build_capture_stream(
             // RT-SHAPED region: no allocation, no lock, no syscall, no log, no panic, no Box.
             // Mirrors smoke.rs lines 96-105 + the `stub_dsp_callback` shape verbatim.
             assert_no_alloc(|| {
-                // Compute frame count from the channel count cpal negotiated. Stack-allocated
-                // mono buffer for the downmix path — no heap allocation.
+                // Compute frame count from the channel count cpal negotiated. The downmix
+                // path borrows from the closure-owned mono_scratch buffer — no heap alloc.
                 let frames = data.len() / n_channels.max(1);
                 if n_channels == 1 {
                     // Mono fast path — push the input slice directly.
@@ -432,15 +437,25 @@ pub fn build_capture_stream(
                     tele.input_rms.store(rms, Ordering::Relaxed);
                 } else {
                     // Stereo (or higher) — downmix to mono by averaging the first two channels
-                    // and discarding any extras. Most consumer interfaces expose exactly 2.
-                    let mut mono = [0.0f32; MONO_BUF_LEN];
-                    let n = frames.min(MONO_BUF_LEN);
-                    for (i, slot) in mono.iter_mut().take(n).enumerate() {
+                    // (D-16). Trailing channels are intentionally discarded; the engine is
+                    // single-channel end-to-end. `pick_input_config` already constrains the
+                    // channel count to {1, 2}, but a >2-channel future relaxation would still
+                    // be handled here without overrun thanks to the stride-by-n_channels.
+                    let cap = mono_scratch.len();
+                    let n = frames.min(cap);
+                    if frames > cap {
+                        // Defensive: cpal handed us a callback bigger than our buffer ceiling.
+                        // Should not happen given how max_frames was computed, but log a
+                        // dropout via tele.xruns rather than silently lose the audio.
+                        tele.xruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for (i, slot) in mono_scratch.iter_mut().take(n).enumerate() {
                         let base = i * n_channels;
                         *slot = (data[base] + data[base + 1]) * 0.5;
                     }
-                    let _ = in_tx.push_entire_slice(&mono[..n]);
-                    let sum_sq: f32 = mono[..n].iter().map(|s| s * s).sum();
+                    let mono = &mono_scratch[..n];
+                    let _ = in_tx.push_entire_slice(mono);
+                    let sum_sq: f32 = mono.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / n.max(1) as f32).sqrt();
                     tele.input_rms.store(rms, Ordering::Relaxed);
                 }
@@ -515,13 +530,6 @@ pub fn build_virtual_output_stream(
         buffer_size,
     };
 
-    // Atomic for tracking the "last matched capture sequence number" the playback side has
-    // already paired with a capture timestamp. Avoids re-pairing the same (seq, ts) on every
-    // callback. Phase 1 keeps it simple — the playback callback drains the ts ring fully each
-    // call and pairs the most recent capture-ts it observed.
-    let last_capture_ts = Arc::new(AtomicCaptureInstant::new());
-    let last_capture_ts_cb = last_capture_ts.clone();
-
     let stream = device.build_output_stream::<f32, _, _>(
         &requested,
         move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
@@ -545,22 +553,36 @@ pub fn build_virtual_output_stream(
                     }
                 }
 
-                // (3) Latency pairing. Drain ALL available pairs from ts_rx (keeps the ring
-                //    from filling up); remember the latest capture-ts we saw. Then compute
-                //    `playback_ts - latest_capture_ts` and EMA-smooth into tele.latency_ms.
+                // (3) Latency pairing (CR-02 fix). Drain `ts_rx`; only update `latency_ms` if
+                //     we observed at least ONE fresh `(seq, capture_ts)` pair on this callback.
+                //     The previous design cached the last-seen capture_ts across callbacks and
+                //     paired it against every playback_ts — so when capture stalled (xrun,
+                //     buffer-size desync, post-reconnect window), `playback_ts - stale_capture_ts`
+                //     produced a monotonically rising saw-tooth value that bore no relation to
+                //     actual round-trip latency. The new behavior: skip the EMA on callbacks
+                //     where no fresh pair arrived, letting the meter retain its last good
+                //     value instead of inflating it.
                 //
-                //    A3 clock-origin caveat: on Mac (mach_absolute_time) + Win (QPC) the
-                //    capture-stream and output-stream StreamInstant origins agree in practice.
+                //     A3 clock-origin caveat: on Windows (QueryPerformanceCounter) the capture
+                //     and playback `StreamInstant` origins agree in practice.
+                let mut fresh_capture_ts: Option<StreamInstant> = None;
                 while let Ok(pair) = ts_rx.pop() {
-                    last_capture_ts_cb.store(pair.1);
+                    fresh_capture_ts = Some(pair.1);
                 }
-                if let Some(capture_ts) = last_capture_ts_cb.load() {
+                if let Some(capture_ts) = fresh_capture_ts {
                     let playback_ts = info.timestamp().playback;
                     if let Some(delta) = playback_ts.duration_since(&capture_ts) {
                         let ms = duration_to_ms(delta);
-                        let prev = tele.latency_ms.load(Ordering::Relaxed);
-                        let smoothed = (1.0 - LATENCY_EMA_ALPHA) * prev + LATENCY_EMA_ALPHA * ms;
-                        tele.latency_ms.store(smoothed, Ordering::Relaxed);
+                        // Safety net: a single >200 ms reading is almost certainly a clock-
+                        // origin mismatch (rare on Windows but defensive). Hard ceiling at
+                        // 200 ms (well above the spec's 80 ms hard ceiling) — skip rather
+                        // than smear an outlier into the EMA.
+                        if ms <= 200.0 {
+                            let prev = tele.latency_ms.load(Ordering::Relaxed);
+                            let smoothed =
+                                (1.0 - LATENCY_EMA_ALPHA) * prev + LATENCY_EMA_ALPHA * ms;
+                            tele.latency_ms.store(smoothed, Ordering::Relaxed);
+                        }
                     }
                 }
             });
@@ -587,80 +609,6 @@ pub fn build_virtual_output_stream(
 #[inline]
 fn duration_to_ms(d: Duration) -> f32 {
     d.as_secs_f32() * 1000.0
-}
-
-/// Lock-free holder for the most-recent capture `StreamInstant` observed by the playback
-/// callback. `StreamInstant` is `Copy` (two i64+u32 fields) — we pack secs into an `AtomicI64`
-/// and nanos+present-bit into an `AtomicU64`.
-///
-/// Avoids a `Mutex<Option<StreamInstant>>` (locks forbidden on the RT path). Stores are
-/// Relaxed because both the capture and playback callbacks already serialize through the
-/// `ts_rx` SPSC ring; this holder is just the "remembered latest" cache on the consumer side.
-struct AtomicCaptureInstant {
-    // We use two u64s: `secs_plus_one` (0 = "no value", n>0 means actual secs = n-1) +
-    // `nanos`. This keeps the holder allocation-free and pointer-sized atomics — `AtomicU64`
-    // is available on every cpal-supported 64-bit target (macOS Apple Silicon, Windows x86_64).
-    secs_plus_one: std::sync::atomic::AtomicU64,
-    nanos: std::sync::atomic::AtomicU32,
-}
-
-impl AtomicCaptureInstant {
-    fn new() -> Self {
-        Self {
-            secs_plus_one: std::sync::atomic::AtomicU64::new(0),
-            nanos: std::sync::atomic::AtomicU32::new(0),
-        }
-    }
-
-    /// Store the latest `StreamInstant`. RT-safe.
-    fn store(&self, ts: StreamInstant) {
-        // We store nanos first then secs, so a torn read recovers gracefully (load checks
-        // secs > 0 first). Since playback callback is the sole consumer, real tearing is
-        // impossible — we still order writes for forward-compat.
-        self.nanos.store(ts.as_nanos_field(), Ordering::Relaxed);
-        self.secs_plus_one
-            .store(ts.as_secs_field() as u64 + 1, Ordering::Relaxed);
-    }
-
-    /// Load the latest `StreamInstant`. Returns `None` if no value has been stored yet.
-    fn load(&self) -> Option<StreamInstant> {
-        let s = self.secs_plus_one.load(Ordering::Relaxed);
-        if s == 0 {
-            return None;
-        }
-        let secs = (s - 1) as i64;
-        let nanos = self.nanos.load(Ordering::Relaxed);
-        Some(StreamInstant::new(secs, nanos))
-    }
-}
-
-/// Helper trait — cpal does not expose `StreamInstant`'s internal `(secs, nanos)` fields.
-/// We need them for the lock-free `AtomicCaptureInstant` holder. Re-derive via the public
-/// `add` / `duration_since` APIs by anchoring to `StreamInstant::new(0, 0)` and the
-/// difference duration.
-trait StreamInstantExt {
-    fn as_secs_field(&self) -> i64;
-    fn as_nanos_field(&self) -> u32;
-}
-
-impl StreamInstantExt for StreamInstant {
-    fn as_secs_field(&self) -> i64 {
-        // Reconstruct via duration_since(zero). Negative origins (rare; cpal docs only mention
-        // them for unspecified origin) round to 0 — acceptable for the EMA latency input.
-        let zero = StreamInstant::new(0, 0);
-        match self.duration_since(&zero) {
-            Some(d) => d.as_secs() as i64,
-            None => 0,
-        }
-    }
-
-    fn as_nanos_field(&self) -> u32 {
-        let zero = StreamInstant::new(0, 0);
-        match self.duration_since(&zero) {
-            Some(d) => d.subsec_nanos(),
-            None => 0,
-        }
-    }
 }
 
 // Per-VALIDATION rows AUDIO-01, AUDIO-02, AUDIO-05 (revision B3 — the AUDIO-01 row points

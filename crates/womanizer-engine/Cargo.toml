@@ -12,6 +12,15 @@ publish = false
 # feedback-loop detector, and the off-RT event loop. Stays headless: no egui, no SQLite.
 # womanizer-engine -> womanizer-core (D-01 dependency direction). Plans 01-02a/02b/03/04
 # populate the module bodies; this plan only stands up the skeleton + workspace wiring.
+[features]
+# `test-injection` exposes EngineHandle::inject_error and the err_inject_tx Mutex<Producer>
+# field so the AUDIO-09 reconnect integration test in tests/reconnect.rs can synthesize a
+# DeviceFault without a real device disconnect. The feature is OFF in the shipped binary —
+# both `womanizer-app` (production) and the integration test bring the feature in only via
+# [dev-dependencies] (this crate's own test build automatically gets it; downstream crates'
+# dev-dependency declarations must opt in explicitly).
+test-injection = []
+
 [dependencies]
 womanizer-core = { path = "../womanizer-core" }
 cpal = { workspace = true }
@@ -44,3 +53,11 @@ regex = { workspace = true }
 [dev-dependencies]
 serial_test = "3"
 regex = { workspace = true }
+
+# The AUDIO-09 reconnect integration test requires the `test-injection` feature to call
+# EngineHandle::inject_error. Run with `cargo test --features test-injection -p
+# womanizer-engine --test reconnect`. Without the feature, the test target is skipped
+# silently — the feature flag keeps inject_error out of the shipped production binary.
+[[test]]
+name = "reconnect"
+required-features = ["test-injection"]

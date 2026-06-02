@@ -67,7 +67,11 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: test (full suite incl. no-alloc guard)
-        run: cargo test --all
+        # --features enables the AUDIO-09 reconnect integration test (gated behind
+        # womanizer-engine's `test-injection` feature so EngineHandle::inject_error is
+        # absent from production binaries — CR-03 fix). The test itself self-skips on
+        # headless CI runners with no default audio device.
+        run: cargo test --all --features womanizer-engine/test-injection
 
   license-gate:
     name: license-gate

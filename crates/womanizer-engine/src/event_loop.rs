@@ -108,24 +108,36 @@ pub struct EngineHandle {
     /// `tests/reconnect.rs` (AUDIO-09 ground truth — synthesize a `DeviceFault` without a
     /// real device disconnect) and any future chaos / sleep-wake harness in Phase 5.
     ///
-    /// Always present (not feature-gated) because Phase 1's verify gate runs the AUDIO-09
-    /// integration test as `cargo test -p womanizer-engine --test reconnect` — without a
-    /// feature flag — and external integration tests can't reach `#[cfg(test)]`-only
-    /// items. The production UI never calls `inject_error`; the field's cost is one
-    /// `Mutex<rtrb::Producer<EngineError>>` (~ tens of bytes) per Engine instance.
+    /// Feature-gated behind `cfg(any(test, feature = "test-injection"))` (CR-03 fix) so the
+    /// shipped production binary cannot reach the injection path at all — preventing a
+    /// future contributor from accidentally taking the `Mutex` on a UI or RT thread.
+    /// `tests/reconnect.rs` declares `required-features = ["test-injection"]` in
+    /// `Cargo.toml` and is the sole intended caller.
     ///
     /// The `Mutex` wrap is purely to keep the handle `Send + Sync + Clone`; rtrb
     /// `Producer` is `!Sync` by construction.
+    #[cfg(any(test, feature = "test-injection"))]
     pub err_inject_tx: Arc<std::sync::Mutex<Producer<EngineError>>>,
 }
 
+#[cfg(any(test, feature = "test-injection"))]
 impl EngineHandle {
     /// Inject a synthetic engine error into the persistent injection ring the event loop
     /// drains on every 50 ms tick. Used by `tests/reconnect.rs` to exercise the AUDIO-09
     /// path without a real device disconnect. Production UI must NOT call this — it is a
-    /// test/diagnostic hook.
+    /// test/diagnostic hook and is feature-gated out of release builds.
+    ///
+    /// Returns `Ok(())` on push success, `Err(EngineError)` if the mutex was poisoned or
+    /// the ring is full. A poisoned mutex no longer panics the caller; the injection is
+    /// just dropped (the engine is in a degraded state and the test framework will surface
+    /// the original panic anyway).
     pub fn inject_error(&self, e: EngineError) {
-        let mut tx = self.err_inject_tx.lock().expect("err_inject_tx mutex");
+        let Ok(mut tx) = self.err_inject_tx.lock() else {
+            // Poisoned mutex — engine is in a degraded state. Drop the injection rather
+            // than panic-cascade; the original panic that poisoned the lock will surface
+            // through normal test failure reporting.
+            return;
+        };
         // Best-effort: if the ring is full the engine has plenty to drain; dropping a
         // synthetic injection is fine for the test contract.
         let _ = tx.push(e);
@@ -629,13 +641,16 @@ pub fn spawn(
     let (cmd_tx, cmd_rx) = unbounded::<EngineCommand>();
     let (evt_tx, evt_rx) = unbounded::<EngineEvent>();
 
-    // Persistent injection ErrorRing — lives for the lifetime of the engine. Used by the
-    // test injector AND survives across Start/Stop/Start cycles. The producer is wrapped
-    // in `Arc<Mutex<>>` for the test path (so the handle is `Send + Sync + Clone`); the
-    // consumer is owned exclusively by the engine thread.
+    // Persistent injection ErrorRing — lives for the lifetime of the engine. The consumer
+    // is always present (the engine drains it every 50 ms tick); the producer Arc-Mutex
+    // wrapper is only built when the `test-injection` feature is on, so the production
+    // binary cannot reach the inject path (CR-03 gate).
     let (inject_err_tx, inject_err_rx) = ErrorRing::new(64);
 
+    #[cfg(any(test, feature = "test-injection"))]
     let err_inject_tx_handle = Arc::new(std::sync::Mutex::new(inject_err_tx));
+    #[cfg(not(any(test, feature = "test-injection")))]
+    drop(inject_err_tx);
 
     // W8 wiring: construct a single MonitorBannerState that both the engine (writes
     // disconnected/feedback_detected on trip) and the UI (reads them each repaint to render
@@ -676,6 +691,7 @@ pub fn spawn(
         hot,
         tele,
         monitor_banner,
+        #[cfg(any(test, feature = "test-injection"))]
         err_inject_tx: err_inject_tx_handle,
     }
 }
