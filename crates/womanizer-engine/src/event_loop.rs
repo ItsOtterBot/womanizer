@@ -71,10 +71,9 @@ const TICK: Duration = Duration::from_millis(50);
 pub struct EngineState {
     /// Last-selected input device name (mic). `None` → use `default_input_device()`.
     pub selected_input: Option<String>,
-    /// Last-selected virtual-output device name (the device VRChat sees as a mic — the
-    /// rebranded BlackHole on macOS or VB-CABLE on Windows). `None` → use
-    /// `default_output_device()` (a sensible fallback only for development; the real
-    /// product flow always selects the virtual device by name).
+    /// Last-selected virtual-output device name (the device VRChat sees as a mic — VB-CABLE
+    /// Input on Windows). `None` → use `default_output_device()` (a sensible fallback only
+    /// for development; the real product flow always selects the virtual device by name).
     pub selected_virtual_output: Option<String>,
     /// Last-selected monitor (headphones) device name for the self-monitor stream (D-12).
     /// `None` → use `default_output_device()`. If the monitor stream fails to build, the

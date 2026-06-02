@@ -43,8 +43,8 @@ pub struct SetupState {
     /// transition to Ready so the engine's first Start picks the same device the user used
     /// previously. `None` on a fresh-install or if the settings row is absent.
     pub last_input: Option<String>,
-    /// Last-selected virtual-output device name (the rebranded BlackHole on macOS, the
-    /// matched CABLE Input on Windows). Same Phase 1 read-only contract as `last_input`.
+    /// Last-selected virtual-output device name (the matched VB-CABLE Input on Windows).
+    /// Same Phase 1 read-only contract as `last_input`.
     pub last_vout: Option<String>,
     /// Last-selected self-monitor headphone device. Passed into `EngineState.selected_monitor`
     /// on Setup → Ready transition; the Ready shell's headphone dropdown can change it live

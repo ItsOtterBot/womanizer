@@ -8,7 +8,7 @@ publish = false
 
 # Phase 1 (Plan 01-01): cpal audio I/O, the DSP worker thread (Phase 1 = memcpy passthrough;
 # Phase 2+ = signalsmith), the rubato I/O-boundary resampler, per-OS virtual-device detection
-# (BlackHole rebrand presence on macOS / VB-CABLE on Windows), the self-monitor stream +
+# (VB-CABLE presence on Windows), the self-monitor stream +
 # feedback-loop detector, and the off-RT event loop. Stays headless: no egui, no SQLite.
 # womanizer-engine -> womanizer-core (D-01 dependency direction). Plans 01-02a/02b/03/04
 # populate the module bodies; this plan only stands up the skeleton + workspace wiring.
@@ -38,7 +38,7 @@ regex = { workspace = true }
 #
 # regex is moved into dev-dependencies (in addition to the Windows-cfg-gated production dep
 # above) so the `devices::regex_tests` regex-assertion module in devices/mod.rs builds and
-# runs on macOS / Linux dev hosts and CI — VALIDATION.md row DEVICE-04 (revision B2) names
+# runs on Linux / macOS dev hosts and CI — VALIDATION.md row DEVICE-04 (revision B2) names
 # `devices::regex_tests::regex_matches` as the named test and it must be runnable everywhere.
 # Dev-deps are only compiled for `cargo test`, so the shipped release binary is unaffected.
 [dev-dependencies]

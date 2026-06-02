@@ -16,7 +16,7 @@
 //! - `"input_device_id"`: the user-visible cpal device name (matches
 //!   `cpal::Device::description().name()`) for the mic input.
 //! - `"virtual_output_device_id"`: the user-visible name of the virtual-audio device VRChat
-//!   sees as a microphone (the rebranded BlackHole `"Womanizer"` on macOS; the
+//!   sees as a microphone (the
 //!   regex-matched-canonical `"CABLE Input (VB-Audio Virtual Cable)"` on Windows).
 //! - `"monitor_device_id"`: the user-visible name of the headphone output the self-monitor
 //!   stream targets when `HotParams::monitor_enabled == true`.

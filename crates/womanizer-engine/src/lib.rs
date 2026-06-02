@@ -2,7 +2,7 @@
 //!
 //! Owns the cpal stream lifecycle, the DSP worker (Phase 1: memcpy passthrough; Phase 2+:
 //! signalsmith Stretch), the rubato I/O-boundary resampler, the per-OS virtual-device
-//! detector (rebranded BlackHole presence on macOS / VB-CABLE on Windows), the self-monitor
+//! detector (VB-CABLE presence on Windows), the self-monitor
 //! stream + feedback-loop detector, and the off-RT event loop that drives EngineCommand /
 //! EngineEvent and drains the ErrorRing.
 //!

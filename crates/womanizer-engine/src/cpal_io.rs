@@ -61,7 +61,7 @@ pub const BLOCK: usize = 256;
 /// #3). Devices whose native rate differs go through `resampler.rs` at the I/O boundary.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
-/// Channel count the virtual-output device must support (D-16 — rebranded BlackHole ships as
+/// Channel count the virtual-output device must support (D-16 — VB-CABLE ships as
 /// 2-channel stereo). The engine processes mono internally and writes the same sample to both
 /// channels at the virtual-device boundary.
 pub const OUTPUT_CHANNELS: u16 = 2;

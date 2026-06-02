@@ -1,8 +1,8 @@
-//! Per-OS virtual-device detection — `Womanizer` (rebranded BlackHole) on macOS;
-//! `CABLE Input (VB-Audio Virtual Cable)` on Windows.
+//! Virtual-device detection — `CABLE Input (VB-Audio Virtual Cable)` on Windows.
 //!
-//! D-10: auto-detect via `cfg(target_os = ...)` at compile time, render only the relevant
-//! per-OS path. Plan 01-04 ships the real implementations.
+//! Womanizer is Windows-only (rescoped after Phase 1: VRChat does not ship on macOS).
+//! Non-Windows builds (Linux dev hosts, CI runners) compile against the fallback `detect()`
+//! below so the crate is still usable for code review and unit testing.
 //!
 //! `DetectionResult` lives here (not inside a per-OS module) so callers can pattern-match
 //! the result without their own `#[cfg]` arms.
@@ -17,38 +17,30 @@
 /// add a sibling regex `^CABLE-[A-Z]? Input \(VB-Audio Cable [A-Z]?\)$` and union the results.
 pub const VB_CABLE_REGEX: &str = r"(?i)^CABLE Input(?: \(VB-Audio Virtual Cable\))?$";
 
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "macos")]
-pub use macos::detect;
-
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::detect;
 
-// Fallback `detect()` for non-{macos, windows} hosts (e.g. Linux dev machines, CI runners).
-// Phase 1's target platforms are macOS Apple Silicon + Windows 10/11 only (PROJECT.md), but
-// keeping the crate buildable on Linux avoids breaking developers who do code review or run
-// `cargo test --lib` on a Linux box.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Fallback `detect()` for non-Windows hosts (Linux / macOS dev machines, CI runners).
+// Womanizer ships on Windows 10/11 only; keeping the crate buildable on other platforms
+// avoids breaking developers who do code review or run `cargo test --lib` off-target.
+#[cfg(not(target_os = "windows"))]
 pub fn detect() -> DetectionResult {
     DetectionResult::NotFound {
-        reason: "platform not supported: Womanizer ships on macOS + Windows only".to_string(),
+        reason: "platform not supported: Womanizer ships on Windows only".to_string(),
     }
 }
 
 /// Outcome of a single virtual-device detection attempt.
 ///
-/// Returned by the per-OS `detect()` functions; the egui setup gate (Plan 01-05) renders
-/// `Found` as `✓ Womanizer detected` / `✓ CABLE Input detected` (D-11) and `NotFound` as
-/// `✗ Not detected — {reason}`.
+/// Returned by `detect()`; the egui setup gate (Plan 01-05) renders `Found` as
+/// `✓ CABLE Input detected` (D-11) and `NotFound` as `✗ Not detected — {reason}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectionResult {
     /// A matching virtual-device was found and passes the 48 kHz / 2-ch / f32 capability check.
     Found {
-        /// Human-readable device name as reported by cpal (`"Womanizer"` on macOS;
-        /// `"CABLE Input (VB-Audio Virtual Cable)"` on Windows).
+        /// Human-readable device name as reported by cpal (`"CABLE Input (VB-Audio Virtual Cable)"`).
         device_name: String,
         /// Opaque device id the engine uses to re-open the same device on reconnect (D-21).
         device_id: String,
@@ -64,8 +56,8 @@ pub enum DetectionResult {
 
 /// Regex-string assertion tests. Compiled and run on every host OS (the regex string itself
 /// is host-independent) — the `regex` crate is a `dev-dependency` of `womanizer-engine` so
-/// this test module builds on macOS and Linux even though the production `devices/windows.rs`
-/// only compiles on Windows.
+/// this test module builds on Linux and macOS dev hosts even though the production
+/// `devices/windows.rs` only compiles on Windows.
 ///
 /// VALIDATION.md row DEVICE-04 (revision B2) points at `devices::regex_tests::regex_matches`
 /// as the named test for the VB-CABLE strict-match contract — this module provides it.

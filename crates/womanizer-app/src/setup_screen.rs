@@ -25,27 +25,18 @@ pub fn render(state: &mut SetupState, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.label("To route audio to VRChat, Womanizer needs a virtual audio device.");
     ui.separator();
 
-    // --- Per-OS install instructions (D-10: compile-time cfg, not runtime) ---
-    #[cfg(target_os = "macos")]
-    {
-        ui.label("On macOS, install the Womanizer audio driver:");
-        ui.code("cd drivers/macos-blackhole && ./install.sh install");
-        ui.label("Then approve the Womanizer device in:");
-        ui.label("System Settings → Privacy & Security");
-        ui.label("System Settings → Sound → Output (Womanizer should appear)");
-    }
+    // --- Install instructions ---
     #[cfg(target_os = "windows")]
     {
-        ui.label("On Windows, install VB-CABLE from the official download:");
+        ui.label("Install VB-CABLE from the official download:");
         ui.hyperlink_to("Download VB-CABLE", "https://vb-audio.com/Cable/");
         ui.label("After install, Windows will register CABLE Input as a playback device.");
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     {
         ui.label(
-            "Note: Womanizer ships only for macOS Apple Silicon + Windows 10/11. This is \
-             likely a developer build on an unsupported platform; detection will return \
-             NotFound.",
+            "Note: Womanizer ships on Windows only. This is likely a developer build on an \
+             unsupported platform; detection will return NotFound.",
         );
     }
 
