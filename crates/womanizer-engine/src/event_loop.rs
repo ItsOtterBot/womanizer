@@ -139,6 +139,31 @@ pub struct EngineHandle {
     /// `Arc<Mutex<Option<RepaintCallback>>>` so the UI can install post-spawn and the engine
     /// thread reads via a brief off-RT lock.
     repaint: Arc<Mutex<Option<RepaintCallback>>>,
+    /// Phase 2 (Plan 02-08) UI → DSP worker high-frequency parameter stream. The Ready
+    /// shell's pitch / formant sliders publish a fresh `VoiceParams` snapshot via
+    /// [`publish_voice_params`](Self::publish_voice_params) on every drag event; the DSP
+    /// worker reads the latest snapshot via its `snap_out` half on every audio block and
+    /// hands the values to `SmoothedVoiceParams` for the 30 ms exponential ramp (D-35) so
+    /// drags are click-free.
+    ///
+    /// `Arc<Mutex<triple_buffer::Input<VoiceParams>>>` wrap rationale: `triple_buffer::Input`
+    /// is `Send` but `!Sync`, and [`EngineHandle`] is `#[derive(Clone)]` so the UI can
+    /// hand clones to sub-widgets; an `Arc<Mutex<_>>` keeps `Clone` working without
+    /// changing the trait bounds. The Mutex is taken only on the UI thread on slider drag —
+    /// contention is essentially zero in practice (single writer, no contention with the
+    /// audio thread which uses the `Output` half).
+    ///
+    /// Promoted in Plan 02-08 — the field was constructed in `build_streams_and_worker`
+    /// since Phase 1 (Plan 01-02b) but had no UI writer; the underscore-prefixed binding
+    /// is dropped here and the writer side surfaced on the handle.
+    ///
+    /// Wrapped in `Option` because the triple_buffer pair is rebuilt on every
+    /// `EngineCommand::Start` (the worker consumes the `Output` half by move; the next
+    /// Start creates a fresh pair). The engine event loop installs `Some(input)` on
+    /// successful Start and clears to `None` on Stop. The UI's
+    /// [`publish_voice_params`](Self::publish_voice_params) is a graceful no-op when the
+    /// engine is Stopped (no DSP worker running → no consumer for the published value).
+    pub snap_in: Arc<Mutex<Option<triple_buffer::Input<VoiceParams>>>>,
 }
 
 #[cfg(any(test, feature = "test-injection"))]
@@ -178,6 +203,27 @@ impl EngineHandle {
     pub fn set_repaint_callback(&self, cb: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(mut g) = self.repaint.lock() {
             *g = Some(cb);
+        }
+    }
+
+    /// Publish a fresh [`VoiceParams`] snapshot to the DSP worker via the lock-free
+    /// `triple_buffer` writer. Called from the UI thread on every pitch / formant slider
+    /// drag event (Plan 02-08, D-23 + D-35).
+    ///
+    /// Triple-buffer semantics: overwrites the back buffer; the next worker `snap_out.read()`
+    /// observes the latest published value. Drops the previous unread snapshot silently —
+    /// exactly what the slider-drag use case wants (the worker only ever needs the most
+    /// recent target value; the SmoothedVoiceParams interpolator handles in-between values).
+    ///
+    /// A poisoned Mutex (engine in degraded state) results in the publish being dropped —
+    /// the UI continues responsive and the panic that poisoned the lock surfaces through
+    /// normal channels.
+    pub fn publish_voice_params(&self, params: VoiceParams) {
+        if let Ok(mut g) = self.snap_in.lock() {
+            if let Some(input) = g.as_mut() {
+                input.write(params);
+            }
+            // Else: engine is Stopped, no consumer for the value — graceful no-op.
         }
     }
 }
@@ -248,6 +294,15 @@ struct Engine {
     // `evt_tx.send()` and every banner mutation so the UI observes state changes within one
     // frame.
     repaint: Arc<Mutex<Option<RepaintCallback>>>,
+
+    // --- Phase 2 triple_buffer<VoiceParams> writer slot shared with EngineHandle (Plan 02-08) ---
+    //
+    // The engine event-loop thread installs `Some(input)` here on a successful Start (after
+    // `build_streams_and_worker` constructs the triple_buffer pair and moves the `Output`
+    // half into the DSP worker) and clears to `None` on Stop. The UI side reads through
+    // [`EngineHandle::publish_voice_params`] on every slider drag — if the slot is `None`
+    // (engine Stopped) the publish is a graceful no-op.
+    snap_in: Arc<Mutex<Option<triple_buffer::Input<VoiceParams>>>>,
 }
 
 impl Engine {
@@ -440,8 +495,16 @@ impl Engine {
         let (capture_err_tx, capture_err_rx) = ErrorRing::new(32);
         let (vout_err_tx, vout_err_rx) = ErrorRing::new(32);
 
-        // ---- triple_buffer snapshot — Phase 1 ignores contents; Phase 4 writes voices ----
-        let (_snap_in, snap_out) = triple_buffer::triple_buffer(&VoiceParams::default());
+        // ---- triple_buffer snapshot — Phase 1 ignored contents; Plan 02-08 installs the
+        // writer side on `EngineHandle::snap_in` so the UI's pitch / formant sliders publish
+        // a fresh `VoiceParams` on every drag (D-23 + D-35). The worker consumes the reader
+        // side via `snap_out.read()` once per audio block. The pair is rebuilt on every
+        // Start because the Output half is consumed (moved) by the worker; on Stop the
+        // snap_in slot on the handle clears back to `None`.
+        let (snap_in, snap_out) = triple_buffer::triple_buffer(&VoiceParams::default());
+        if let Ok(mut g) = self.snap_in.lock() {
+            *g = Some(snap_in);
+        }
 
         // ---- counters + wake ----
         let samples_since_wake = Arc::new(AtomicUsize::new(0));
@@ -651,6 +714,14 @@ impl Engine {
         // is NOT cleared here: a sticky disconnect banner survives Stop so the UI can show
         // it after a teardown caused by a DeviceFault.
         self.feedback_detector = None;
+
+        // Plan 02-08: clear the snap_in writer slot shared with `EngineHandle`. The Output
+        // half was consumed by the now-joined worker thread (dropped); the Input half
+        // becomes meaningless without a paired Output. The UI's `publish_voice_params`
+        // becomes a graceful no-op until the next Start rebuilds the pair.
+        if let Ok(mut g) = self.snap_in.lock() {
+            *g = None;
+        }
     }
 
     /// Drain ALL error-ring consumers (injection + capture + virtual-output) into
@@ -837,6 +908,13 @@ pub fn spawn(
     // notify_repaint().
     let repaint: Arc<Mutex<Option<RepaintCallback>>> = Arc::new(Mutex::new(None));
 
+    // Plan 02-08: shared snap_in slot for the Phase 2 triple_buffer<VoiceParams> writer. The
+    // engine event-loop thread installs `Some(input)` on a successful Start (inside
+    // `build_streams_and_worker` after the triple_buffer pair is constructed) and clears to
+    // `None` on Stop. The UI's `EngineHandle::publish_voice_params` reads through here on
+    // every slider drag — graceful no-op when the slot is `None`.
+    let snap_in: Arc<Mutex<Option<triple_buffer::Input<VoiceParams>>>> = Arc::new(Mutex::new(None));
+
     let engine = Engine {
         cmd_rx,
         evt_tx,
@@ -852,6 +930,7 @@ pub fn spawn(
         worker: None,
         feedback_detector: None,
         repaint: repaint.clone(),
+        snap_in: snap_in.clone(),
     };
 
     // IN-02: wrap engine.run() in catch_unwind so a panic on the engine thread surfaces as
@@ -890,6 +969,7 @@ pub fn spawn(
         #[cfg(any(test, feature = "test-injection"))]
         err_inject_tx: err_inject_tx_handle,
         repaint,
+        snap_in,
     }
 }
 
