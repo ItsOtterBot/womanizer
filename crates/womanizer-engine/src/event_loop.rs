@@ -32,7 +32,7 @@
 //! scope per D-21: in-memory device-ID preservation only; SQLite roundtrip + UX flourishes
 //! land in Phase 5.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::thread::Builder;
 use std::time::Duration;
@@ -184,9 +184,6 @@ struct Engine {
     // `Telemetry::input_rms` (written by the cpal capture callback) and on trip clears
     // `HotParams::monitor_enabled` + sets `monitor_banner.feedback_detected = true` (D-14).
     feedback_detector: Option<FeedbackDetector>,
-
-    // --- diagnostic tick counter for periodic snapshot logging ---
-    diag_tick: u32,
 }
 
 impl Engine {
@@ -242,40 +239,6 @@ impl Engine {
                     // yellow banner (D-13 + AUDIO-08 500 ms total budget).
                     if let Some(fd) = self.feedback_detector.as_mut() {
                         fd.tick();
-                    }
-                    // Diagnostic snapshot every ~1 second (20 × 50 ms ticks) while running.
-                    // Prints input RMS / xrun count / latency_ms and the worker-side wake
-                    // and chunk counters so we can see where the audio chain is breaking.
-                    self.diag_tick = self.diag_tick.wrapping_add(1);
-                    if self.diag_tick.is_multiple_of(20) && self.streams.is_some() {
-                        let rms = self.tele.input_rms.load(Ordering::Relaxed);
-                        let xruns = self.tele.xruns.load(Ordering::Relaxed);
-                        let latency = self.tele.latency_ms.load(Ordering::Relaxed);
-                        let monitor_on = self.hot.monitor_enabled.load(Ordering::Relaxed);
-                        let wakes = crate::worker::DIAG_DSP_WAKES.load(Ordering::Relaxed);
-                        let chunks = crate::worker::DIAG_DSP_CHUNKS.load(Ordering::Relaxed);
-                        let mon_writes = crate::worker::DIAG_MO_WRITES.load(Ordering::Relaxed);
-                        let mon_callback =
-                            crate::monitor::DIAG_MONITOR_CALLBACK.load(Ordering::Relaxed);
-                        let mon_drain = crate::monitor::DIAG_MONITOR_DRAIN.load(Ordering::Relaxed);
-                        let mon_under =
-                            crate::monitor::DIAG_MONITOR_UNDERRUN.load(Ordering::Relaxed);
-                        tracing::info!(
-                            input_rms = rms,
-                            xruns,
-                            latency_ms = latency,
-                            monitor_on,
-                            dsp_wakes = wakes,
-                            dsp_chunks = chunks,
-                            mon_writes,
-                            monitor_callback = mon_callback,
-                            monitor_drain = mon_drain,
-                            monitor_underrun = mon_under,
-                            input_dev = ?self.state.selected_input,
-                            vout_dev = ?self.state.selected_virtual_output,
-                            mon_dev = ?self.state.selected_monitor,
-                            "DIAG"
-                        );
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -697,7 +660,6 @@ pub fn spawn(
         streams: None,
         worker: None,
         feedback_detector: None,
-        diag_tick: 0,
     };
 
     // Spawn the engine event-loop thread. We do not retain the JoinHandle — the engine
