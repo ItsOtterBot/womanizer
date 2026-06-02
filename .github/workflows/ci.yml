@@ -52,6 +52,16 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
+      - name: Install LLVM (Windows — libclang required by bindgen for signalsmith-stretch)
+        # signalsmith-stretch 0.1.3 pulls bindgen ^0.70 as a build-dep; bindgen needs
+        # libclang.dll at build time. Visual Studio Build Tools does NOT ship libclang —
+        # only the LLVM toolchain does. Without this step the first clean build on a
+        # Windows runner fails with "error: Unable to find libclang" (RESEARCH §Pitfall 3
+        # / T-2-build-env). macOS runners use Apple's clang via Xcode CLT and need no
+        # install; the `if:` guard keeps the install out of the macos-14 job.
+        if: runner.os == 'Windows'
+        run: choco install llvm --yes --no-progress
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
