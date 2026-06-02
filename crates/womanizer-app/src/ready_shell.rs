@@ -18,8 +18,8 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 use womanizer_engine::{
-    enumerate_inputs, enumerate_outputs, EngineCommand, DISCONNECT_BANNER_COPY,
-    FEEDBACK_BANNER_COPY, RESAMPLE_BANNER_TEMPLATE,
+    enumerate_inputs, enumerate_outputs, render_resample_banner, EngineCommand,
+    DISCONNECT_BANNER_COPY, FEEDBACK_BANNER_COPY,
 };
 
 use crate::app::ReadyState;
@@ -31,10 +31,7 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
     // (a) Sample-rate-mismatch yellow banner (AUDIO-04, D-05 verbatim).
     // Predicate: SampleRateState::read() returns Some(native_hz).
     if let Some(hz) = state.sample_rate_state.read() {
-        ui.colored_label(
-            egui::Color32::YELLOW,
-            RESAMPLE_BANNER_TEMPLATE.replace("{}", &hz.to_string()),
-        );
+        ui.colored_label(egui::Color32::YELLOW, render_resample_banner(hz));
     }
 
     // (b) Feedback-detected yellow banner (AUDIO-08, D-14 verbatim) with `×` dismiss.

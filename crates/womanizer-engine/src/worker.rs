@@ -16,7 +16,7 @@
 //!    the `Arc<AtomicUsize> samples_since_wake` counter the cpal capture callback in
 //!    `cpal_io.rs` bumps, and calls `DspWakeHandle::wake()` whenever ≥ `BLOCK` samples are
 //!    available. This thread exists because `wake()` may syscall (`Thread::unpark()` on
-//!    macOS/Windows can issue a condition-variable signal) and the cpal callback is forbidden
+//!    Windows can issue a condition-variable signal) and the cpal callback is forbidden
 //!    from syscalling per wake.rs:8-14 + RESEARCH Anti-Pattern A7.
 //!
 //! ## Why a separate pump thread instead of `Producer::slots()`
@@ -196,8 +196,8 @@ pub fn spawn_dsp_worker(
 ///
 /// This is the SOLE site that calls `wake()` in response to capture progress. The cpal
 /// capture callback only bumps the atomic counter and never syscalls; this thread runs OFF
-/// the audio callback so its `unpark()` syscall (Linux futex / macOS+Windows condvar) is
-/// permitted (wake.rs:8-14).
+/// the audio callback so its `unpark()` syscall (Windows condvar) is permitted
+/// (wake.rs:8-14).
 ///
 /// Memory ordering: the cpal callback bumps `samples_since_wake` with `Release`. We load
 /// with `Acquire` so any sample data pushed into InputRing BEFORE the callback's atomic
@@ -219,7 +219,11 @@ pub fn spawn_capture_pump(
                 samples_since_wake.fetch_sub(BLOCK, Ordering::AcqRel);
                 wake.wake();
             }
-            std::thread::sleep(PUMP_POLL_INTERVAL);
+            // WR-01: `park_timeout` (not `sleep`) so the Stop handler can call
+            // `pump_thread.thread().unpark()` to break out immediately instead of waiting up
+            // to PUMP_POLL_INTERVAL for the sleep to expire. Spurious wakeups are fine — the
+            // outer loop just re-checks `stop_flag` and the samples counter.
+            std::thread::park_timeout(PUMP_POLL_INTERVAL);
         })
 }
 

@@ -44,7 +44,7 @@ pub use cpal_io::{enumerate_inputs, enumerate_outputs, BLOCK, SAMPLE_RATE_HZ};
 // Ready shell consumes for the three yellow banners (AUDIO-04 sample-rate-mismatch,
 // AUDIO-08 feedback-detected, AUDIO-09 disconnected).
 pub use monitor::{MonitorBannerState, DISCONNECT_BANNER_COPY, FEEDBACK_BANNER_COPY};
-pub use resampler::{SampleRateState, RESAMPLE_BANNER_TEMPLATE};
+pub use resampler::{render_resample_banner, SampleRateState, RESAMPLE_BANNER_TEMPLATE};
 
 // Re-export the off-audio-thread command/event types womanizer-core publishes so the UI can
 // `use womanizer_engine::{EngineCommand, EngineEvent}` without depending on womanizer-core

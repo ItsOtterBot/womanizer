@@ -40,10 +40,22 @@ use thiserror::Error;
 use crate::cpal_io::{BLOCK, SAMPLE_RATE_HZ};
 
 /// Banner copy for the AUDIO-04 yellow sample-rate-mismatch indicator. D-05 verbatim.
-/// The UI in Plan 01-05 renders `format!(RESAMPLE_BANNER_TEMPLATE, hz)` when
-/// `SampleRateState::read()` returns `Some(hz)`.
+/// The `{}` slot is substituted by [`render_resample_banner`] (preferred), or by callers
+/// running `.replace("{}", &hz.to_string())` directly.
+///
+/// `format!` is NOT usable here because `format!` requires a literal format string — the
+/// template is a runtime-loaded `&'static str` constant so `.replace` is the only valid
+/// substitution. The doc previously promised `format!(...)` semantics which would silently
+/// fail to compile; corrected here (IN-05).
 pub const RESAMPLE_BANNER_TEMPLATE: &str =
     "Resampling from {} Hz → 48 kHz. A native 48 kHz device gives best quality.";
+
+/// Render [`RESAMPLE_BANNER_TEMPLATE`] with the native rate substituted into the `{}` slot.
+/// Colocated with the template so any future change to the substitution mechanism (or the
+/// slot syntax) updates here and at the caller in lock-step (IN-05).
+pub fn render_resample_banner(native_hz: u32) -> String {
+    RESAMPLE_BANNER_TEMPLATE.replace("{}", &native_hz.to_string())
+}
 
 /// Number of mono channels the engine processes end-to-end. The resampler is constructed for
 /// this channel count; `rubato::FftFixedIn::<f32>::new(.., .., .., .., 1)`.

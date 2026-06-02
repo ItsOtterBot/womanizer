@@ -133,7 +133,7 @@ impl Default for MonitorBannerState {
 /// Pick a mono-or-stereo 48 kHz f32 output config for the user's monitor (headphone) device.
 ///
 /// Most physical headphone outputs are stereo, but some USB audio interfaces present mono,
-/// and the cpal default-output-config on Mac/Win is the device's native shape. We accept
+/// and the cpal default-output-config on Windows is the device's native shape. We accept
 /// either channel count and let the callback handle the channels==1 vs channels==2 routing
 /// (duplicate-on-2-channels for stereo) at the cpal-buffer boundary.
 fn pick_monitor_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineBuildError> {
@@ -193,7 +193,7 @@ pub fn build_monitor_output_stream(
     // We accept Fixed(BLOCK) or fall back to the device's range / Default. Reuse the
     // cpal_io.rs helper indirectly via Default — keeping pick_buffer_size private to
     // cpal_io.rs is fine since the monitor stream's latency budget is not load-bearing for
-    // the AUDIO-06 round-trip measurement. The cpal default size on Mac/Win is small enough
+    // the AUDIO-06 round-trip measurement. The cpal default size on Windows is small enough
     // (usually 256-512) for the monitor use case.
     let buffer_size = match supported.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } => {

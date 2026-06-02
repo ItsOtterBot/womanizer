@@ -6,12 +6,12 @@
 //! allocation-free primitive for this handshake.
 //!
 //! IMPORTANT: "allocation-free" is NOT the same as "syscall-free". `Thread::unpark()` may
-//! issue a futex wake on Linux or a condition-variable signal on macOS/Windows when the
-//! target thread is currently parked — both are kernel transitions. The audio-callback rule
-//! forbids syscalls, so [`DspWakeHandle::wake`] MUST be called from a thread OTHER than the
-//! cpal audio callback (typically a capture-side worker that has already drained the input
-//! ring off the callback). The hot audio callback itself should only push samples into the
-//! ring and never invoke `wake` directly.
+//! issue a condition-variable signal on Windows when the target thread is currently parked
+//! — a kernel transition. The audio-callback rule forbids syscalls, so
+//! [`DspWakeHandle::wake`] MUST be called from a thread OTHER than the cpal audio callback
+//! (typically a capture-side worker that has already drained the input ring off the
+//! callback). The hot audio callback itself should only push samples into the ring and
+//! never invoke `wake` directly.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,8 +39,8 @@ impl DspWakeHandle {
     }
 
     /// Wake the parked DSP worker. Allocation-free and lock-free, but NOT syscall-free:
-    /// `Thread::unpark()` can issue a futex wake (Linux) or condition-variable signal
-    /// (macOS/Windows) when the worker is currently parked.
+    /// `Thread::unpark()` can issue a condition-variable signal on Windows when the worker
+    /// is currently parked.
     ///
     /// Because the audio callback must not perform syscalls, this method MUST be called
     /// from a thread other than the cpal audio callback. The intended caller is a

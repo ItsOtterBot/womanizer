@@ -22,9 +22,9 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::detect;
 
-// Fallback `detect()` for non-Windows hosts (Linux / macOS dev machines, CI runners).
-// Womanizer ships on Windows 10/11 only; keeping the crate buildable on other platforms
-// avoids breaking developers who do code review or run `cargo test --lib` off-target.
+// Fallback `detect()` for non-Windows hosts (Linux dev machines, CI runners). Womanizer
+// ships on Windows 10/11 only; keeping the crate buildable on other platforms avoids
+// breaking developers who do code review or run `cargo test --lib` off-target.
 #[cfg(not(target_os = "windows"))]
 pub fn detect() -> DetectionResult {
     DetectionResult::NotFound {
@@ -36,13 +36,22 @@ pub fn detect() -> DetectionResult {
 ///
 /// Returned by `detect()`; the egui setup gate (Plan 01-05) renders `Found` as
 /// `✓ CABLE Input detected` (D-11) and `NotFound` as `✗ Not detected — {reason}`.
+///
+/// ## Phase 1 caveat on `device_id`
+/// cpal 0.17.3 does not surface stable WASAPI endpoint IDs through `DeviceTrait`, so
+/// `Found::device_id` is currently the same string as `Found::device_name` (the user-visible
+/// name). It is therefore NOT a stable identifier — it changes if the user renames the
+/// device in the Windows audio control panel or after some driver updates. Phase 5 may
+/// diverge the two by surfacing the underlying WASAPI endpoint id via `windows-rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectionResult {
     /// A matching virtual-device was found and passes the 48 kHz / 2-ch / f32 capability check.
     Found {
         /// Human-readable device name as reported by cpal (`"CABLE Input (VB-Audio Virtual Cable)"`).
         device_name: String,
-        /// Opaque device id the engine uses to re-open the same device on reconnect (D-21).
+        /// Phase 1: equals `device_name` (no stable id available via cpal 0.17.3).
+        /// Treat as a name-based placeholder for the reconnect-by-id contract (D-21);
+        /// Phase 5 may replace with a stable WASAPI endpoint id.
         device_id: String,
     },
     /// No matching virtual-device was found, or detection failed. The reason is user-facing

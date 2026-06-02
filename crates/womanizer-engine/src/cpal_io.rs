@@ -310,9 +310,6 @@ fn pick_buffer_size(supported: &SupportedBufferSize) -> BufferSize {
 /// disambiguable. cpal stores the interface friendly name in `description().driver()`.
 /// This helper composites `"{name} ({driver})"` when a driver string is present and
 /// distinct from the name, otherwise returns `name` alone.
-///
-/// On macOS the `driver` field is typically `None` (CoreAudio doesn't expose the same
-/// dual-naming split), so the composed string is the same as the bare name — no regression.
 fn composed_device_name(desc: &cpal::DeviceDescription) -> String {
     match desc.driver() {
         Some(drv) if !drv.is_empty() && drv != desc.name() => {
@@ -367,30 +364,6 @@ pub fn enumerate_outputs() -> Vec<String> {
             Vec::new()
         }
     }
-}
-
-/// Match a composed name (`"endpoint (driver)"`) back to its cpal device. The reverse of
-/// [`composed_device_name`] — used by the event loop's `find_*_device_by_name` to resolve
-/// a UI-picked name to a device handle for stream construction.
-pub fn match_input_device_by_composed_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-    host.input_devices().ok()?.find(|d| {
-        d.description()
-            .ok()
-            .as_ref()
-            .map(composed_device_name)
-            .is_some_and(|n| n == name)
-    })
-}
-
-/// Same as [`match_input_device_by_composed_name`] for output devices.
-pub fn match_output_device_by_composed_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-    host.output_devices().ok()?.find(|d| {
-        d.description()
-            .ok()
-            .as_ref()
-            .map(composed_device_name)
-            .is_some_and(|n| n == name)
-    })
 }
 
 /// Build the RT-safe capture stream (mic → InputRing).
@@ -553,11 +526,11 @@ pub fn build_capture_stream(
 ///    no allocation).
 ///
 /// ### Clock-origin caveat (A3 from RESEARCH)
-/// `cpal::StreamInstant` origins are documented per-stream-may-differ. On macOS
-/// (`mach_absolute_time`) and Windows (`QueryPerformanceCounter`) the capture-stream and
-/// output-stream instants are anchored to the same system clock in practice, so
-/// `playback_ts.duration_since(&capture_ts)` is meaningful. Phase 5 may add an explicit
-/// self-check; Phase 1 documents and accepts the per-stream-origin assumption.
+/// `cpal::StreamInstant` origins are documented per-stream-may-differ. On Windows
+/// (`QueryPerformanceCounter`) the capture-stream and output-stream instants are anchored to
+/// the same system clock in practice, so `playback_ts.duration_since(&capture_ts)` is
+/// meaningful. Phase 5 may add an explicit self-check; Phase 1 documents and accepts the
+/// per-stream-origin assumption.
 #[allow(clippy::too_many_arguments)]
 pub fn build_virtual_output_stream(
     device: &cpal::Device,

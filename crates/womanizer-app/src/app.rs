@@ -171,11 +171,14 @@ impl App {
         matches!(self, App::Ready(_))
     }
 
-    /// Pure function (no egui ctx) the DEVICE-05 test calls to verify the transition
-    /// predicate: the app should transition out of Setup iff a flash timer is set AND has
-    /// elapsed. The actual transition mutation lives in `eframe::App::update`.
-    pub fn should_transition_now(state: &SetupState) -> bool {
-        state.flash_until.is_some_and(|t| Instant::now() >= t)
+    /// Pure function (no egui ctx, no clock access) the DEVICE-05 test calls to verify the
+    /// transition predicate: the app should transition out of Setup iff a flash timer is
+    /// set AND has elapsed. Callers pass an explicit `now: Instant` (e.g. `Instant::now()`
+    /// on the live update path; a controlled value in tests) so the function is genuinely
+    /// pure and the test can simulate clock states without setting `flash_until` to a value
+    /// derived from `Instant::now()` (WR-05 fix).
+    pub fn should_transition_now(state: &SetupState, now: Instant) -> bool {
+        state.flash_until.is_some_and(|t| now >= t)
     }
 
     /// Drain any events sitting on `handle.evt_rx` into banner-state flags. Called once per
@@ -232,7 +235,7 @@ impl eframe::App for App {
         // Phase 2: transition decision.
         match self {
             App::Setup(s) => {
-                if App::should_transition_now(s) {
+                if App::should_transition_now(s, Instant::now()) {
                     // Take the device-id slots OUT of SetupState before constructing
                     // EngineState — they're moved, not cloned. A manual pick (picked_vout)
                     // overrides the last-selected slot so the user's chosen device reaches
@@ -250,6 +253,14 @@ impl eframe::App for App {
                         std::sync::Arc::new(default_hot_params()),
                         std::sync::Arc::new(default_telemetry()),
                     );
+                    // WR-04: install an event-driven repaint callback so the engine thread
+                    // can nudge the UI when banner state changes (disconnect, feedback-
+                    // detected, Started/Stopped). Without this, banner toggles wait up to
+                    // 33 ms for the fallback request_repaint_after tick.
+                    let ctx_for_repaint = ctx.clone();
+                    handle.set_repaint_callback(std::sync::Arc::new(move || {
+                        ctx_for_repaint.request_repaint();
+                    }));
                     *self = App::Ready(ReadyState::new(
                         handle,
                         selected_input,
@@ -329,10 +340,12 @@ mod tests {
             device_name: "Test".into(),
             device_id: "Test".into(),
         });
-        // Flash already elapsed (in the past).
-        state.flash_until = Some(Instant::now() - Duration::from_millis(1));
+        let flash_at = Instant::now();
+        state.flash_until = Some(flash_at);
+        // Caller passes a `now` strictly after the flash deadline.
+        let now = flash_at + Duration::from_millis(1);
         assert!(
-            App::should_transition_now(&state),
+            App::should_transition_now(&state, now),
             "transition predicate must be true once flash has elapsed (DEVICE-05)"
         );
     }
@@ -347,9 +360,11 @@ mod tests {
             device_name: "Test".into(),
             device_id: "Test".into(),
         });
-        state.flash_until = Some(Instant::now() + Duration::from_secs(5));
+        let now = Instant::now();
+        // Flash deadline well in the future relative to the `now` we pass in.
+        state.flash_until = Some(now + Duration::from_secs(5));
         assert!(
-            !App::should_transition_now(&state),
+            !App::should_transition_now(&state, now),
             "transition predicate must be false until the flash window elapses (D-11)"
         );
     }

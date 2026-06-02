@@ -45,7 +45,6 @@ pub const DB_FILENAME: &str = "womanizer.sqlite3";
 /// schema, and seed the Default voice on first launch.
 ///
 /// Resolves the path via `ProjectDirs::from("com", "OtterBot", "Womanizer")`:
-///   - macOS: `~/Library/Application Support/com.OtterBot.Womanizer/`
 ///   - Windows: `%APPDATA%\OtterBot\Womanizer\data\`
 ///
 /// The directory is created if missing. Returns an open [`Connection`] ready for CRUD.

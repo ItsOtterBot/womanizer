@@ -33,7 +33,7 @@
 //! land in Phase 5.
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::Builder;
 use std::time::Duration;
 
@@ -56,6 +56,13 @@ use crate::worker::{self, WorkerHandles};
 /// Plan 01-05) ticks the feedback-loop detector. Matches the cadence the RESEARCH "Engine
 /// handle + start/stop driven by EngineCommand" example uses.
 const TICK: Duration = Duration::from_millis(50);
+
+/// Optional UI-supplied callback the engine calls after every emit/banner-write so the egui
+/// repaint loop observes engine-side state changes within one frame instead of waiting for
+/// the next 33 ms fallback repaint (WR-04 fix). The engine thread is off-RT — taking the
+/// Mutex on each call costs ≈ 50 ns and the path is bounded by the 50 ms tick anyway. Stored
+/// boxed-Fn so the engine crate stays headless (no `egui` dependency).
+type RepaintCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// In-memory state preserved across `EngineCommand::Start` cycles. After a `DeviceFault`
 /// fires, the user clicks the reconnect banner and the UI re-sends `EngineCommand::Start`;
@@ -125,6 +132,13 @@ pub struct EngineHandle {
     /// `Producer` is `!Sync` by construction.
     #[cfg(any(test, feature = "test-injection"))]
     pub err_inject_tx: Arc<std::sync::Mutex<Producer<EngineError>>>,
+    /// WR-04: UI-installable repaint callback. The UI calls `set_repaint_callback` once
+    /// during Setup → Ready transition with a closure that invokes
+    /// `egui::Context::request_repaint()`; the engine thread invokes it after every
+    /// `evt_tx.send()` and every `MonitorBannerState` mutation. Stored as
+    /// `Arc<Mutex<Option<RepaintCallback>>>` so the UI can install post-spawn and the engine
+    /// thread reads via a brief off-RT lock.
+    repaint: Arc<Mutex<Option<RepaintCallback>>>,
 }
 
 #[cfg(any(test, feature = "test-injection"))]
@@ -148,6 +162,23 @@ impl EngineHandle {
         // Best-effort: if the ring is full the engine has plenty to drain; dropping a
         // synthetic injection is fine for the test contract.
         let _ = tx.push(e);
+    }
+}
+
+impl EngineHandle {
+    /// Install a callback the engine thread invokes after every `evt_tx.send()` and every
+    /// banner-state mutation. Intended caller: the UI's Setup → Ready transition, passing a
+    /// closure that calls `egui::Context::request_repaint()`. Replacing an existing callback
+    /// is allowed (the most recent install wins).
+    ///
+    /// Without this, the egui repaint loop falls back to the 33 ms `request_repaint_after`
+    /// tick, so a banner toggle between repaints incurs up to 33 ms of visual latency
+    /// (WR-04). With this installed, repaint fires within a single egui frame of the engine
+    /// emission.
+    pub fn set_repaint_callback(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut g) = self.repaint.lock() {
+            *g = Some(cb);
+        }
     }
 }
 
@@ -209,14 +240,41 @@ struct Engine {
     // `Telemetry::input_rms` (written by the cpal capture callback) and on trip clears
     // `HotParams::monitor_enabled` + sets `monitor_banner.feedback_detected = true` (D-14).
     feedback_detector: Option<FeedbackDetector>,
+
+    // --- repaint callback (WR-04) ---
+    //
+    // Shared with `EngineHandle`. The UI installs a closure that calls
+    // `egui::Context::request_repaint()`; the engine thread invokes it after every
+    // `evt_tx.send()` and every banner mutation so the UI observes state changes within one
+    // frame.
+    repaint: Arc<Mutex<Option<RepaintCallback>>>,
 }
 
 impl Engine {
+    /// Invoke the UI-installed repaint callback, if any. Cheap off-RT lock — called after
+    /// every `evt_tx.send()` and every banner-state mutation so the UI repaints within one
+    /// frame instead of waiting for its 33 ms fallback tick (WR-04).
+    fn notify_repaint(&self) {
+        if let Ok(g) = self.repaint.lock() {
+            if let Some(cb) = g.as_ref() {
+                cb();
+            }
+        }
+    }
+
     /// Run the event loop until the command channel is disconnected (sender drop).
     fn run(mut self) {
         tracing::info!("engine event loop entering recv_timeout(50ms) main loop");
         loop {
-            match self.cmd_rx.recv_timeout(TICK) {
+            let arm = self.cmd_rx.recv_timeout(TICK);
+            // Drain error rings on EVERY arm (WR-03 fix). The old "Timeout-only" drain meant a
+            // burst of commands could delay error visibility by one full tick per command; the
+            // injection test in `inject_error_delivers_to_evt_rx` flaked when a stray
+            // EngineCommand arrived before the drain. Draining unconditionally is cheap (a
+            // tight pop loop on three rtrb consumers) and makes the "errors flush within one
+            // recv_timeout round-trip" claim hold regardless of command traffic.
+            self.drain_error_ring();
+            match arm {
                 Ok(EngineCommand::Start) => self.handle_start(),
                 Ok(EngineCommand::Stop) => self.handle_stop(),
                 Ok(EngineCommand::SelectVoice(id)) => {
@@ -252,7 +310,6 @@ impl Engine {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    self.drain_error_ring();
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms
                     // cadence as the ErrorRing drain. The detector is only present while
                     // streams are Started (built in `build_streams_and_worker`, dropped in
@@ -263,7 +320,14 @@ impl Engine {
                     // `monitor_banner.feedback_detected = true` so the UI repaints the
                     // yellow banner (D-13 + AUDIO-08 500 ms total budget).
                     if let Some(fd) = self.feedback_detector.as_mut() {
+                        let before = self.monitor_banner.is_feedback_detected();
                         fd.tick();
+                        // WR-04: if the detector tripped (or cleared on re-arm), prompt the
+                        // UI to repaint immediately so the banner update isn't gated on the
+                        // 33 ms fallback tick.
+                        if before != self.monitor_banner.is_feedback_detected() {
+                            self.notify_repaint();
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -306,6 +370,7 @@ impl Engine {
                     .send(EngineEvent::Error(EngineError::DeviceFault));
             }
         }
+        self.notify_repaint();
     }
 
     /// Build capture + virtual-output streams + spawn DSP/pump workers. Resolves device
@@ -319,14 +384,12 @@ impl Engine {
             Some(name) => find_input_device_by_name(&host, name).or_else(|| {
                 tracing::warn!(
                     name = %name,
-                    "selected input device not found; falling back to default_input_device (AUDIO-09 in-memory fallback)"
+                    "selected input device not found; falling back to host default (AUDIO-09 in-memory fallback)"
                 );
                 host.default_input_device()
             }),
             None => {
-                tracing::warn!(
-                    "no selected_input set; using default_input_device (AUDIO-09 in-memory fallback)"
-                );
+                tracing::info!("no input device selected; using host default");
                 host.default_input_device()
             }
         }
@@ -336,14 +399,12 @@ impl Engine {
             Some(name) => find_output_device_by_name(&host, name).or_else(|| {
                 tracing::warn!(
                     name = %name,
-                    "selected virtual-output device not found; falling back to default_output_device (AUDIO-09 in-memory fallback)"
+                    "selected virtual-output device not found; falling back to host default (AUDIO-09 in-memory fallback)"
                 );
                 host.default_output_device()
             }),
             None => {
-                tracing::warn!(
-                    "no selected_virtual_output set; using default_output_device (AUDIO-09 in-memory fallback)"
-                );
+                tracing::info!("no virtual-output device selected; using host default");
                 host.default_output_device()
             }
         }
@@ -533,6 +594,7 @@ impl Engine {
         if was_running {
             tracing::info!("engine stopped");
             let _ = self.evt_tx.send(EngineEvent::Stopped);
+            self.notify_repaint();
         }
     }
 
@@ -548,13 +610,19 @@ impl Engine {
             worker
                 .stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            // CRITICAL: a bare `unpark()` is NOT sufficient — `wake.wait()` only exits its
-            // park-loop when `pending` is true, and a bare unpark leaves `pending=false`, so
-            // the DSP worker would just re-park forever and `join()` would deadlock (the
-            // hang Andrew hit live: Stop click → event loop frozen → Start ignored). Use the
-            // full `wake()` (sets `pending=true` AND unparks) so the wait() loop observes
-            // pending, returns, then checks stop_flag and exits.
+            // CRITICAL: a bare `unpark()` is NOT sufficient for the DSP worker — `wake.wait()`
+            // only exits its park-loop when `pending` is true, and a bare unpark leaves
+            // `pending=false`, so the DSP worker would just re-park forever and `join()` would
+            // deadlock (the hang Andrew hit live: Stop click → event loop frozen → Start
+            // ignored). Use the full `wake()` (sets `pending=true` AND unparks) so the
+            // wait() loop observes pending, returns, then checks stop_flag and exits.
             worker.stop_wake.wake();
+            // WR-01: the pump thread parks on `park_timeout(500µs)`. A bare `unpark()` is
+            // exactly the right primitive for it: there is no pending-flag protocol — the
+            // pump's loop simply re-checks `stop_flag` after the park returns, so an
+            // unpark-induced spurious wakeup observes the just-set flag and exits.
+            // Eliminates the up-to-500µs Stop→Stopped tail latency.
+            worker.pump_thread.thread().unpark();
             // join() returns Result<()> wrapping the thread's panic if any; ignore both
             // outcomes in the stop path (panics surface separately via tracing in worker).
             let _ = worker.dsp_thread.join();
@@ -585,6 +653,7 @@ impl Engine {
     /// (the event-channel emission AND the banner flag) are in place — the UI is free to
     /// listen on either; the banner-flag path is the simpler 30-Hz repaint check.
     fn drain_error_ring(&mut self) {
+        let mut emitted = false;
         while let Ok(e) = self.inject_err_rx.pop() {
             tracing::warn!(
                 ?e,
@@ -594,6 +663,7 @@ impl Engine {
                 self.monitor_banner.set_disconnected();
             }
             let _ = self.evt_tx.send(EngineEvent::Error(e));
+            emitted = true;
         }
         if let Some(rx) = self.capture_err_rx.as_mut() {
             while let Ok(e) = rx.pop() {
@@ -602,6 +672,7 @@ impl Engine {
                     self.monitor_banner.set_disconnected();
                 }
                 let _ = self.evt_tx.send(EngineEvent::Error(e));
+                emitted = true;
             }
         }
         if let Some(rx) = self.vout_err_rx.as_mut() {
@@ -611,7 +682,14 @@ impl Engine {
                     self.monitor_banner.set_disconnected();
                 }
                 let _ = self.evt_tx.send(EngineEvent::Error(e));
+                emitted = true;
             }
+        }
+        // WR-04: nudge the UI to repaint immediately if anything was emitted, so the user
+        // sees the disconnect banner / xrun counter bump within one egui frame instead of
+        // waiting up to 33 ms for the next request_repaint_after tick.
+        if emitted {
+            self.notify_repaint();
         }
     }
 }
@@ -643,24 +721,57 @@ enum EngineBootError {
 /// Look up an input device by user-visible name. The name is the composed `"endpoint (driver)"`
 /// form produced by `cpal_io::enumerate_inputs`; falls back to a bare-name match (for legacy
 /// settings rows written before the composed-name change). Returns `None` if no match.
+///
+/// WR-06: enumerates `input_devices()` ONCE and checks both predicates per device — composed
+/// name match is preferred (D-19), bare-name match is the legacy-fallback path. The previous
+/// implementation enumerated twice on a composed-name miss; on a dev workstation with many
+/// audio interfaces this could spend tens of milliseconds twice per `SetInput` command.
 fn find_input_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     use cpal::traits::{DeviceTrait, HostTrait};
-    cpal_io::match_input_device_by_composed_name(host, name).or_else(|| {
-        host.input_devices()
-            .ok()?
-            .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
-    })
+    let mut fallback: Option<cpal::Device> = None;
+    for d in host.input_devices().ok()? {
+        let Ok(desc) = d.description() else {
+            continue;
+        };
+        let composed = match desc.driver() {
+            Some(drv) if !drv.is_empty() && drv != desc.name() => {
+                format!("{} ({})", desc.name(), drv)
+            }
+            _ => desc.name().to_string(),
+        };
+        if composed == name {
+            return Some(d);
+        }
+        if fallback.is_none() && desc.name() == name {
+            fallback = Some(d);
+        }
+    }
+    fallback
 }
 
-/// Look up an output device by user-visible name. Same fallback contract as
+/// Look up an output device by user-visible name. Same single-pass enumeration as
 /// `find_input_device_by_name`.
 fn find_output_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     use cpal::traits::{DeviceTrait, HostTrait};
-    cpal_io::match_output_device_by_composed_name(host, name).or_else(|| {
-        host.output_devices()
-            .ok()?
-            .find(|d| d.description().ok().is_some_and(|desc| desc.name() == name))
-    })
+    let mut fallback: Option<cpal::Device> = None;
+    for d in host.output_devices().ok()? {
+        let Ok(desc) = d.description() else {
+            continue;
+        };
+        let composed = match desc.driver() {
+            Some(drv) if !drv.is_empty() && drv != desc.name() => {
+                format!("{} ({})", desc.name(), drv)
+            }
+            _ => desc.name().to_string(),
+        };
+        if composed == name {
+            return Some(d);
+        }
+        if fallback.is_none() && desc.name() == name {
+            fallback = Some(d);
+        }
+    }
+    fallback
 }
 
 /// Public spawner: creates the cmd/evt channels, constructs the engine struct, spawns the
@@ -709,6 +820,11 @@ pub fn spawn(
     // clone so the UI's yellow banner reads the same atomic the engine writes.
     let sample_rate_state = SampleRateState::new();
 
+    // WR-04: shared repaint slot. The UI installs a closure post-spawn via
+    // `handle.set_repaint_callback(...)`; the engine thread reads the slot on each
+    // notify_repaint().
+    let repaint: Arc<Mutex<Option<RepaintCallback>>> = Arc::new(Mutex::new(None));
+
     let engine = Engine {
         cmd_rx,
         evt_tx,
@@ -723,15 +839,33 @@ pub fn spawn(
         streams: None,
         worker: None,
         feedback_detector: None,
+        repaint: repaint.clone(),
     };
 
-    // Spawn the engine event-loop thread. We do not retain the JoinHandle — the engine
-    // exits when its cmd channel sees `Disconnected` (i.e. when the UI drops the
-    // EngineHandle and we drop cmd_tx). Production runs forever; tests drop the handle
-    // and the thread exits within ~50 ms (one recv_timeout tick).
+    // IN-02: wrap engine.run() in catch_unwind so a panic on the engine thread surfaces as
+    // an EngineEvent::Error to the UI (best-effort) before the thread exits, rather than
+    // silently disconnecting evt_rx and leaving the UI with no diagnostic context.
+    // We do not retain the JoinHandle — the engine exits when its cmd channel sees
+    // `Disconnected` (i.e. when the UI drops the EngineHandle and we drop cmd_tx).
+    // Production runs forever; tests drop the handle and the thread exits within ~50 ms
+    // (one recv_timeout tick).
     let _join = Builder::new()
         .name("womanizer-engine-loop".to_string())
-        .spawn(move || engine.run())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.run();
+            }));
+            if let Err(payload) = result {
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".to_string()
+                };
+                tracing::error!(panic = %msg, "engine event loop panicked");
+            }
+        })
         .expect("spawn engine event loop thread");
 
     EngineHandle {
@@ -743,6 +877,7 @@ pub fn spawn(
         sample_rate_state,
         #[cfg(any(test, feature = "test-injection"))]
         err_inject_tx: err_inject_tx_handle,
+        repaint,
     }
 }
 

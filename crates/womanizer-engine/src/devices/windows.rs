@@ -50,8 +50,8 @@ pub fn detect() -> DetectionResult {
             // Compose `"endpoint (driver)"` like cpal_io::enumerate_outputs does so the
             // returned Found.device_name matches the dropdown labels in the Ready shell —
             // user picks consistently surface the same device when they manually re-pick.
-            // On Windows this evaluates to "CABLE Input (VB-Audio Virtual Cable)"; on macOS
-            // and on devices without a `driver` field it collapses to the bare endpoint name.
+            // On Windows this evaluates to "CABLE Input (VB-Audio Virtual Cable)"; on devices
+            // without a `driver` field it collapses to the bare endpoint name.
             let desc = d.description().ok()?;
             let composed = match desc.driver() {
                 Some(drv) if !drv.is_empty() && drv != desc.name() => {
@@ -82,9 +82,9 @@ pub fn detect() -> DetectionResult {
 
     let (device, name) = matched.into_iter().next().unwrap();
 
-    // Capability check identical in spirit to devices/macos.rs::detect — read-only metadata
-    // probe, NOT a build_output_stream + drop. Opening the device might fail when other
-    // software (VRChat, Discord) already holds it active for capture.
+    // Capability check: read-only metadata probe, NOT a build_output_stream + drop. Opening
+    // the device might fail when other software (VRChat, Discord) already holds it active
+    // for capture.
     let target: SampleRate = 48_000;
     let supports_48k_stereo_f32 = device
         .supported_output_configs()
