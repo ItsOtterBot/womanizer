@@ -49,6 +49,7 @@ use crate::cpal_io::{
     TS_RING_CAPACITY,
 };
 use crate::monitor::{FeedbackDetector, MonitorBannerState};
+use crate::resampler::SampleRateState;
 use crate::worker::{self, WorkerHandles};
 
 /// 50 ms event-loop tick — the cadence at which the engine drains the `ErrorRing` and (in
@@ -103,6 +104,12 @@ pub struct EngineHandle {
     /// drains an `EngineError::DeviceFault` from the ErrorRing. Cloned via inner Arcs so UI
     /// and engine see the same atomics.
     pub monitor_banner: MonitorBannerState,
+    /// Wait-free publisher of the current sample-rate-mismatch state (AUDIO-04 yellow
+    /// banner). The engine sets this in `build_streams_and_worker` when the picked input
+    /// device's native rate is not 48 kHz; the UI clones this on the Setup → Ready
+    /// transition and reads it each repaint to render `RESAMPLE_BANNER_TEMPLATE`. Cloned
+    /// via inner `Arc<AtomicU32>` so both sides see the same atomic without locking.
+    pub sample_rate_state: SampleRateState,
     /// ErrorRing producer the engine drains on every 50 ms tick alongside the per-Start
     /// capture / virtual-output rings. The principal consumer is the integration test in
     /// `tests/reconnect.rs` (AUDIO-09 ground truth — synthesize a `DeviceFault` without a
@@ -162,6 +169,13 @@ struct Engine {
     // MonitorBannerState struct is cloned into `EngineHandle::monitor_banner` so both sides
     // see the same Arc<AtomicBool> pair.
     monitor_banner: MonitorBannerState,
+
+    // --- AUDIO-04 sample-rate-mismatch publisher (shared with the EngineHandle) ---
+    //
+    // Engine writes the input device's native rate when it picks a non-48-kHz input config
+    // (and clears on a successful 48-kHz pick). The UI clones this and reads each repaint
+    // to render the AUDIO-04 yellow banner verbatim per D-05.
+    sample_rate_state: SampleRateState,
 
     // --- in-memory device-name state preserved across reconnect (AUDIO-09 + D-21) ---
     state: EngineState,
@@ -382,9 +396,38 @@ impl Engine {
         // cpal_io public signatures require it; production behavior is correct.
         let engine_wake = DspWakeHandle::new(std::thread::current());
 
+        // ---- Pick the input config + decide whether a rubato resampler is needed.
+        //      AUDIO-03 + AUDIO-04: when the device's native rate isn't 48 kHz, we
+        //      construct a Resampler48k(native_rate), pass it into the capture stream so
+        //      the callback resamples mono native → mono 48k on the fly, AND publish the
+        //      native rate to `sample_rate_state` so the UI lights up the yellow banner.
+        //      A successful 48 kHz pick clears the banner.
+        let input_config =
+            cpal_io::pick_input_config(&input_device).map_err(EngineBootError::BuildCapture)?;
+        let input_resampler = if input_config.sample_rate() != cpal_io::SAMPLE_RATE_HZ {
+            let native = input_config.sample_rate();
+            let rs = crate::resampler::Resampler48k::new(native).map_err(|e| {
+                tracing::error!(
+                    ?e,
+                    native,
+                    "resampler init failed; surfacing as device fault"
+                );
+                EngineBootError::BuildCapture(cpal_io::EngineBuildError::NoCompatibleConfig {
+                    channels: 1,
+                })
+            })?;
+            self.sample_rate_state.set_mismatch(native);
+            tracing::info!(native, "rubato Resampler48k engaged for input device");
+            Some(rs)
+        } else {
+            self.sample_rate_state.clear();
+            None
+        };
+
         // ---- build capture + virtual-output streams (rings already constructed) ----
         let input_stream = build_capture_stream(
             &input_device,
+            input_config,
             in_tx,
             samples_since_wake,
             ts_tx,
@@ -392,6 +435,7 @@ impl Engine {
             self.tele.clone(),
             capture_err_tx,
             engine_wake.clone(),
+            input_resampler,
         )
         .map_err(EngineBootError::BuildCapture)?;
 
@@ -661,12 +705,17 @@ pub fn spawn(
     // build fails, error event emits, banner reflects the disconnected state immediately).
     let monitor_banner = MonitorBannerState::new();
 
+    // AUDIO-04 sample-rate publisher — shared with the EngineHandle via internal Arc<AtomicU32>
+    // clone so the UI's yellow banner reads the same atomic the engine writes.
+    let sample_rate_state = SampleRateState::new();
+
     let engine = Engine {
         cmd_rx,
         evt_tx,
         hot: hot.clone(),
         tele: tele.clone(),
         monitor_banner: monitor_banner.clone(),
+        sample_rate_state: sample_rate_state.clone(),
         state: initial_state,
         inject_err_rx,
         capture_err_rx: None,
@@ -691,6 +740,7 @@ pub fn spawn(
         hot,
         tele,
         monitor_banner,
+        sample_rate_state,
         #[cfg(any(test, feature = "test-injection"))]
         err_inject_tx: err_inject_tx_handle,
     }

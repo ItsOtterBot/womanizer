@@ -129,9 +129,10 @@ impl ReadyState {
         selected_monitor: Option<String>,
     ) -> Self {
         let monitor_banner = handle.monitor_banner.clone();
+        let sample_rate_state = handle.sample_rate_state.clone();
         Self {
             handle,
-            sample_rate_state: SampleRateState::new(),
+            sample_rate_state,
             monitor_banner,
             disconnect_dismissed: false,
             selected_input,

@@ -157,38 +157,67 @@ pub type TimestampPair = (u64, StreamInstant);
 pub fn pick_input_config(device: &cpal::Device) -> Result<SupportedStreamConfig, EngineBuildError> {
     let target: SampleRate = SAMPLE_RATE_HZ;
 
-    // Prefer mono (1ch — the engine is single-channel end-to-end). Fall back to stereo (2ch);
-    // [`build_capture_stream`] downmixes L+R in its callback so the engine still sees mono
-    // frames. Many consumer mics + USB interfaces (and VB-CABLE Output) only advertise
-    // stereo; refusing them would lock out real users.
-    let mut mono_candidate: Option<cpal::SupportedStreamConfigRange> = None;
-    let mut stereo_candidate: Option<cpal::SupportedStreamConfigRange> = None;
+    // Priority order:
+    //   1. mono @ 48 kHz   — fast path, no resampling, no downmix
+    //   2. stereo @ 48 kHz — callback downmixes L+R, no resampling
+    //   3. mono @ other    — capture-pump thread runs rubato through Resampler48k
+    //   4. stereo @ other  — downmix + rubato
+    // Caller checks supported.sample_rate() against SAMPLE_RATE_HZ to decide whether to
+    // instantiate a Resampler48k (AUDIO-03 + AUDIO-04 — the yellow banner fires when the
+    // device's native rate is not 48 kHz).
+    let mut mono_at_48k: Option<cpal::SupportedStreamConfigRange> = None;
+    let mut stereo_at_48k: Option<cpal::SupportedStreamConfigRange> = None;
+    let mut mono_other: Option<cpal::SupportedStreamConfigRange> = None;
+    let mut stereo_other: Option<cpal::SupportedStreamConfigRange> = None;
     for range in device.supported_input_configs()? {
-        let rate_ok = range.min_sample_rate() <= target && range.max_sample_rate() >= target;
-        let fmt_ok = range.sample_format() == SampleFormat::F32;
-        if !rate_ok || !fmt_ok {
+        if range.sample_format() != SampleFormat::F32 {
             continue;
         }
-        match range.channels() {
-            1 if mono_candidate.is_none() => mono_candidate = Some(range),
-            2 if stereo_candidate.is_none() => stereo_candidate = Some(range),
+        let supports_48k = range.min_sample_rate() <= target && range.max_sample_rate() >= target;
+        match (range.channels(), supports_48k) {
+            (1, true) if mono_at_48k.is_none() => mono_at_48k = Some(range),
+            (2, true) if stereo_at_48k.is_none() => stereo_at_48k = Some(range),
+            (1, false) if mono_other.is_none() => mono_other = Some(range),
+            (2, false) if stereo_other.is_none() => stereo_other = Some(range),
             _ => {}
         }
     }
-    let range =
-        mono_candidate
-            .or(stereo_candidate)
-            .ok_or(EngineBuildError::NoCompatibleConfig {
-                channels: INPUT_CHANNELS,
-            })?;
-    let supported = range.with_sample_rate(target);
-    // Assert rate + format. Channel count is intentionally NOT asserted here: the input path
-    // accepts either 1 or 2 channels and the callback downmixes stereo → mono.
-    if supported.sample_rate() != SAMPLE_RATE_HZ {
-        return Err(EngineBuildError::NegotiatedWrongRate {
-            got: supported.sample_rate(),
+
+    let (range, use_target_rate) = if let Some(r) = mono_at_48k {
+        (r, true)
+    } else if let Some(r) = stereo_at_48k {
+        (r, true)
+    } else if let Some(r) = mono_other {
+        (r, false)
+    } else if let Some(r) = stereo_other {
+        (r, false)
+    } else {
+        return Err(EngineBuildError::NoCompatibleConfig {
+            channels: INPUT_CHANNELS,
         });
-    }
+    };
+
+    let supported = if use_target_rate {
+        let cfg = range.with_sample_rate(target);
+        // Defense in depth: confirm cpal honored the requested rate.
+        if cfg.sample_rate() != SAMPLE_RATE_HZ {
+            return Err(EngineBuildError::NegotiatedWrongRate {
+                got: cfg.sample_rate(),
+            });
+        }
+        cfg
+    } else {
+        // Non-48k path: pick the device's MAX supported rate (typically its preferred /
+        // native rate; rubato adapts to any input rate). Caller sees the non-48k rate via
+        // `supported.sample_rate()` and constructs a `Resampler48k(native)`.
+        let native = range.max_sample_rate();
+        tracing::info!(
+            native,
+            "input device does not support 48 kHz natively; will resample via rubato"
+        );
+        range.with_sample_rate(native)
+    };
+
     if supported.sample_format() != SampleFormat::F32 {
         return Err(EngineBuildError::NegotiatedWrongFormat {
             got: supported.sample_format(),
@@ -386,6 +415,7 @@ pub fn match_output_device_by_composed_name(host: &cpal::Host, name: &str) -> Op
 #[allow(clippy::too_many_arguments)]
 pub fn build_capture_stream(
     device: &cpal::Device,
+    supported: SupportedStreamConfig,
     mut in_tx: Producer<AudioFrame>,
     samples_since_wake: Arc<AtomicUsize>,
     mut ts_tx: Producer<TimestampPair>,
@@ -393,8 +423,8 @@ pub fn build_capture_stream(
     tele: Arc<Telemetry>,
     mut err_tx: Producer<EngineError>,
     engine_wake: DspWakeHandle,
+    mut resampler: Option<crate::resampler::Resampler48k>,
 ) -> Result<cpal::Stream, EngineBuildError> {
-    let supported = pick_input_config(device)?;
     let buffer_size = pick_buffer_size(supported.buffer_size());
     let n_channels = supported.channels() as usize;
     let requested = StreamConfig {
@@ -424,50 +454,65 @@ pub fn build_capture_stream(
         &requested,
         move |data: &[f32], info: &cpal::InputCallbackInfo| {
             // RT-SHAPED region: no allocation, no lock, no syscall, no log, no panic, no Box.
-            // Mirrors smoke.rs lines 96-105 + the `stub_dsp_callback` shape verbatim.
+            // The optional resampler's `process_block` is allocation-free per its docs
+            // (input/output bufs are pre-allocated via *_buffer_allocate at construction).
             assert_no_alloc(|| {
-                // Compute frame count from the channel count cpal negotiated. The downmix
-                // path borrows from the closure-owned mono_scratch buffer — no heap alloc.
+                // (1) Reduce to mono native-rate samples. Either the input slice (mono) or
+                //     a downmix into mono_scratch (stereo).
                 let frames = data.len() / n_channels.max(1);
-                if n_channels == 1 {
-                    // Mono fast path — push the input slice directly.
-                    let _ = in_tx.push_entire_slice(data);
-                    let sum_sq: f32 = data.iter().map(|s| s * s).sum();
-                    let rms = (sum_sq / data.len().max(1) as f32).sqrt();
-                    tele.input_rms.store(rms, Ordering::Relaxed);
+                let mono_native: &[f32] = if n_channels == 1 {
+                    data
                 } else {
-                    // Stereo (or higher) — downmix to mono by averaging the first two channels
-                    // (D-16). Trailing channels are intentionally discarded; the engine is
-                    // single-channel end-to-end. `pick_input_config` already constrains the
-                    // channel count to {1, 2}, but a >2-channel future relaxation would still
-                    // be handled here without overrun thanks to the stride-by-n_channels.
                     let cap = mono_scratch.len();
                     let n = frames.min(cap);
                     if frames > cap {
-                        // Defensive: cpal handed us a callback bigger than our buffer ceiling.
-                        // Should not happen given how max_frames was computed, but log a
-                        // dropout via tele.xruns rather than silently lose the audio.
                         tele.xruns.fetch_add(1, Ordering::Relaxed);
                     }
                     for (i, slot) in mono_scratch.iter_mut().take(n).enumerate() {
                         let base = i * n_channels;
                         *slot = (data[base] + data[base + 1]) * 0.5;
                     }
-                    let mono = &mono_scratch[..n];
-                    let _ = in_tx.push_entire_slice(mono);
-                    let sum_sq: f32 = mono.iter().map(|s| s * s).sum();
-                    let rms = (sum_sq / n.max(1) as f32).sqrt();
-                    tele.input_rms.store(rms, Ordering::Relaxed);
-                }
+                    &mono_scratch[..n]
+                };
 
-                // Bump samples_since_wake by frame count (the worker downstream consumes mono
-                // frames, not interleaved samples). Release ordering pairs with the pump
-                // thread's Acquire load so any data pushed above is visible after the wake.
-                samples_since_wake.fetch_add(frames, Ordering::Release);
+                // (2) Resample to 48 kHz if the device's native rate isn't 48k; otherwise
+                //     push the mono native frames directly (which ARE 48k in that case).
+                //     `push_entire_slice` drops on Full (Pattern B). The pushed frame count
+                //     is the value used for `samples_since_wake` so the DSP worker wake
+                //     cadence matches the post-resample 48k engine rate.
+                let pushed_frames = match resampler.as_mut() {
+                    Some(rs) => match rs.process_block(mono_native) {
+                        Ok(out_48k) => {
+                            let _ = in_tx.push_entire_slice(out_48k);
+                            out_48k.len()
+                        }
+                        Err(_) => {
+                            // Should not happen with the fixed chunk shapes we configured;
+                            // surface as an xrun rather than panic the RT callback.
+                            tele.xruns.fetch_add(1, Ordering::Relaxed);
+                            0
+                        }
+                    },
+                    None => {
+                        let _ = in_tx.push_entire_slice(mono_native);
+                        mono_native.len()
+                    }
+                };
 
-                // Push (seq, capture-instant) for latency pairing. Drop-on-Full — the
-                // playback side reads opportunistically and skips on miss (D-06 + A3
-                // clock-origin caveat documented above).
+                // (3) RMS over the native-rate mono slice (cheaper than over the resampled
+                //     output, and accurate for the level meter since resampling preserves RMS).
+                let sum_sq: f32 = mono_native.iter().map(|s| s * s).sum();
+                let rms = (sum_sq / mono_native.len().max(1) as f32).sqrt();
+                tele.input_rms.store(rms, Ordering::Relaxed);
+
+                // (4) Bump samples_since_wake by the POST-RESAMPLE frame count (what the DSP
+                //     worker actually consumes from InputRing). Release ordering pairs with
+                //     the pump thread's Acquire load.
+                samples_since_wake.fetch_add(pushed_frames, Ordering::Release);
+
+                // (5) Push (seq, capture-instant) for latency pairing. Drop-on-Full — the
+                //     playback side reads opportunistically and skips on miss (D-06 + A3
+                //     clock-origin caveat documented above).
                 let seq = block_seq_cb.fetch_add(1, Ordering::Relaxed);
                 let _ = ts_tx.push((seq, info.timestamp().capture));
             });
