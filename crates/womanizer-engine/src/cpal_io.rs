@@ -474,8 +474,9 @@ pub fn build_capture_stream(
 
                 // (3) RMS over the native-rate mono slice (cheaper than over the resampled
                 //     output, and accurate for the level meter since resampling preserves RMS).
-                let sum_sq: f32 = mono_native.iter().map(|s| s * s).sum();
-                let rms = (sum_sq / mono_native.len().max(1) as f32).sqrt();
+                // Phase 2 (Plan 02-07, DSP-06): SIMD via wide::f32x8 — scalar parity verified
+                // by tests/dsp_simd_rms_parity.rs (and lib tests in src/dsp.rs).
+                let rms = crate::dsp::rms_simd(mono_native);
                 tele.input_rms.store(rms, Ordering::Relaxed);
 
                 // (4) Bump samples_since_wake by the POST-RESAMPLE frame count (what the DSP
