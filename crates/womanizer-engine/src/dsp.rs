@@ -427,17 +427,54 @@ impl Default for Yin48k {
 }
 
 /// SIMD-accelerated RMS over a sample slice using `wide::f32x8` (D-34, RESEARCH §Q7).
-/// Hot-path replacement for the scalar `.map(|s| s*s).sum()` pattern in `cpal_io::capture`
-/// and the Gate's per-block RMS computation; the `dsp_simd_rms_parity` test (Plan 02-07)
-/// asserts byte-equivalence with the scalar version within 1e-6.
+/// Hot-path replacement for the scalar `.map(|s| s*s).sum()` pattern in `cpal_io::capture`;
+/// the lib tests (`rms_simd_*` in this file's `tests` mod) and the
+/// `dsp_simd_rms_parity` integration test (Plan 02-07) both assert byte-equivalence with the
+/// scalar `sqrt(sum_sq / len.max(1))` reference within 1e-6 across silence / sine / noise /
+/// constant / remainder-path inputs.
 ///
 /// Returns `sqrt(sum_of_squares / len)` — the standard linear-amplitude RMS. Returns
-/// `0.0` for an empty slice (matches scalar behavior — `0/1` for the `len.max(1)` divisor
-/// pattern used in `cpal_io`). Plan 02-07 fills in the actual SIMD body.
-pub fn rms_simd(_samples: &[f32]) -> f32 {
-    unimplemented!(
-        "filled in by Plan 02-07 — body chunks into wide::f32x8, accumulates squares, sqrt(sum / len)"
-    )
+/// `0.0` for an empty slice (matches scalar behavior via the `len.max(1)` divisor pattern
+/// used in `cpal_io`).
+///
+/// ## Implementation (RESEARCH §Q7 Pattern (a))
+/// - `chunks_exact(8)` over the input → contiguous 8-lane chunks. Each chunk loads into an
+///   `f32x8` via `f32x8::new(arr)`; the running square accumulator is `acc + v * v`. The
+///   lane-wise multiply + add is the f32x8 Add/Mul impls (verified against wide 1.4.0
+///   `src/f32x8_.rs`). At end, `acc.to_array()` exposes the eight lane sums.
+/// - The scalar `chunks.remainder()` slice handles the 0–7 leftover samples that do not
+///   fit an f32x8 — required for non-multiple-of-8 inputs (e.g. the `cpal_io` capture
+///   callback in shared-mode where the device hands us non-power-of-2 frame counts).
+/// - Final reduction: sum of the 8 lanes plus the scalar remainder squares, divided by
+///   `len.max(1)`, sqrt.
+///
+/// ## Allocation profile
+/// `f32x8` is a `#[repr(C)]` value type; all loads / arithmetic happen on stack. No
+/// `Vec::push`, no `Box::new`, no heap. Safe to call inside `assert_no_alloc(|| { ... })`
+/// — `cpal_io::capture` does exactly this (Plan 02-07 Task 2 swap).
+#[inline]
+pub fn rms_simd(samples: &[f32]) -> f32 {
+    use wide::f32x8;
+
+    let mut acc = f32x8::ZERO;
+    let chunks = samples.chunks_exact(8);
+    let remainder = chunks.remainder();
+    for c in chunks {
+        // `chunks_exact(8)` guarantees `c.len() == 8`; the `try_into` is therefore
+        // infallible. Constructing the array literal is a stack-local copy of 8 f32s into
+        // an aligned `[f32; 8]`, which `f32x8::new` accepts directly.
+        let arr: [f32; 8] = c
+            .try_into()
+            .expect("chunks_exact(8) yields exactly 8 elements");
+        let v = f32x8::new(arr);
+        acc += v * v;
+    }
+    let lane_sums = acc.to_array();
+    let mut sum_sq: f32 = lane_sums.iter().copied().sum();
+    for s in remainder {
+        sum_sq += s * s;
+    }
+    (sum_sq / samples.len().max(1) as f32).sqrt()
 }
 
 #[cfg(test)]
@@ -740,6 +777,79 @@ mod tests {
             result.is_none(),
             "Yin48k::get_pitch must return None for white noise (no periodic structure); \
              got {result:?} — clarity threshold may be too lenient or wrapper is misconfigured"
+        );
+    }
+
+    /// Scalar reference RMS — byte-equivalent of the loop currently in `cpal_io.rs` at
+    /// lines 477-479 (`let sum_sq: f32 = mono_native.iter().map(|s| s*s).sum(); (sum_sq /
+    /// mono_native.len().max(1) as f32).sqrt()`). Plan 02-07's parity tests assert that
+    /// `rms_simd` matches this within 1e-6 across all input shapes.
+    fn scalar_rms(samples: &[f32]) -> f32 {
+        let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+        (sum_sq / samples.len().max(1) as f32).sqrt()
+    }
+
+    /// DSP-06 lib test 1: zero buffer of 256 samples → rms_simd returns 0.0 exactly.
+    /// Smallest possible signal; if rms_simd accumulates any garbage from f32x8 lane
+    /// init or chunk remainder handling, this catches it cheaply.
+    #[test]
+    fn rms_simd_zero_buffer() {
+        let input = [0.0f32; 256];
+        let observed = rms_simd(&input);
+        assert!(
+            observed.abs() < 1e-6,
+            "rms_simd([0.0; 256]) returned {observed}, expected 0.0"
+        );
+    }
+
+    /// DSP-06 lib test 2: constant 0.5 buffer of 256 samples → rms_simd returns 0.5
+    /// (RMS of a constant signal is the constant itself). Exercises every f32x8 lane with
+    /// the same finite non-zero value; catches accumulator wiring bugs and divides-by-zero
+    /// in the final `sqrt(sum / len)` step.
+    #[test]
+    fn rms_simd_constant_buffer() {
+        let input = [0.5f32; 256];
+        let observed = rms_simd(&input);
+        assert!(
+            (observed - 0.5).abs() < 1e-6,
+            "rms_simd([0.5; 256]) returned {observed}, expected 0.5 (RMS of constant = constant)"
+        );
+    }
+
+    /// DSP-06 lib test 3: 220 Hz sine over 256 samples at amplitude 0.5 → rms_simd matches
+    /// the cpal_io.rs:477-479 scalar form within 1e-6. The CRITICAL parity gate — proves
+    /// the SIMD implementation reproduces the exact arithmetic of the existing capture path,
+    /// not a subtly different (e.g. Kahan-summed or population-vs-sample-RMS) variant.
+    /// Six orders of magnitude tighter than the UI's three-decimal RMS display so any
+    /// drift the user could perceive would trip this gate first.
+    #[test]
+    fn rms_simd_matches_scalar_220_sine() {
+        let input = sine_window(220.0, 0.5, 256);
+        let simd = rms_simd(&input);
+        let scalar = scalar_rms(&input);
+        assert!(
+            (simd - scalar).abs() < 1e-6,
+            "rms_simd vs scalar_rms parity broken on 220 Hz sine: simd={simd}, scalar={scalar}, diff={}",
+            (simd - scalar).abs()
+        );
+    }
+
+    /// DSP-06 lib test 4: 257-sample buffer (NOT a multiple of 8) — exercises the
+    /// `chunks_exact(8)` scalar-tail remainder path. If the remainder loop is omitted or
+    /// computes the wrong indices, the last sample is silently dropped and parity breaks
+    /// at the 1/257 ≈ 0.4 % level — well above the 1e-6 tolerance.
+    #[test]
+    fn rms_simd_handles_remainder() {
+        let mut input = sine_window(440.0, 0.7, 257);
+        // Make the lone tail sample distinctly non-zero so its presence/absence visibly
+        // moves the result: 257 % 8 = 1 → exactly one remainder lane.
+        input[256] = 0.9;
+        let simd = rms_simd(&input);
+        let scalar = scalar_rms(&input);
+        assert!(
+            (simd - scalar).abs() < 1e-6,
+            "rms_simd remainder-path parity broken at len=257: simd={simd}, scalar={scalar}, diff={}",
+            (simd - scalar).abs()
         );
     }
 
