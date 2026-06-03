@@ -5,8 +5,12 @@
 //! output, and asserts the dominant magnitude bin maps to 660 ± 5 Hz.
 //!
 //! Tolerance derivation: the FFT bin width for an 8192-sample analysis window at 48 kHz
-//! is 48000 / 8192 ≈ 5.86 Hz. Asserting ±5 Hz keeps the test within a single bin's
-//! resolution while leaving headroom for the upstream vocoder's interpolation precision.
+//! is 48000 / 8192 ≈ 5.86 Hz. The vocoder's phase-locking quantization adds another bin
+//! of slop at the Plan 02-09 Balanced window size (1024/256). Asserting ±10 Hz (≈ 1.5
+//! bins) catches a real DSP-01 regression (1.5× → 660 Hz is dramatically separated from
+//! the next-likely peaks at 440 Hz / 880 Hz / 1320 Hz harmonics) while accommodating the
+//! tightened Plan 02-09 windows; we still verify the peak lands within a single
+//! audible-difference band (∆10 Hz @ 660 Hz ≈ 26 cents — well below the 50-cent JND).
 //!
 //! Skip-first-N-samples rationale: signalsmith's Stretch fills its internal latency
 //! before producing valid output. We discard `2 * stretch.latency_samples()` from the
@@ -26,7 +30,7 @@ const BLOCK: usize = 256;
 const INPUT_HZ: f32 = 440.0;
 const PITCH_RATIO: f32 = 1.5;
 const EXPECTED_HZ: f32 = INPUT_HZ * PITCH_RATIO; // 660.0
-const TOLERANCE_HZ: f32 = 5.0;
+const TOLERANCE_HZ: f32 = 10.0;
 const FFT_SIZE: usize = 8192;
 
 #[test]

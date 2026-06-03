@@ -70,9 +70,46 @@ pub const ENGINE_SR: u32 = SAMPLE_RATE_HZ;
 /// Return the `(block_length, interval)` STFT window/hop pair for the given preset.
 ///
 /// 4:1 block-to-hop ratio matches the upstream `presetDefault` overlap and is the
-/// phase-vocoder sweet spot for quality. These are STARTING POINTS — the execute-time
-/// A/B sprint in Plan 02-04 may tighten Quality (D-25 — quality-validate after the
-/// latency budget is met).
+/// phase-vocoder sweet spot for quality. Sized to fit each preset's latency budget per
+/// D-25 + RESEARCH §Q2 empirical-sprint protocol.
+///
+/// ## Plan 02-09 latency-budget tightening (empirical sprint protocol)
+///
+/// The RESEARCH §Q2 starting points (1024/256, 2048/512, 3072/768) were derived from the
+/// optimistic assumption that `input_latency() + output_latency() ≈ block_length / 2`.
+/// Empirical measurement at Plan 02-09 execute time showed the actual sum is approximately
+/// `block_length` (see RESEARCH §Q1: each side contributes ~block_length/2 for a centered
+/// analysis window; the sum is the full block_length). The original windows therefore
+/// would have produced 21.33 / 42.67 / 64.00 ms Stretch latency — Balanced and Quality
+/// blow their D-25 round-trip budgets even before the cpal capture+playback in-flight
+/// overhead is added.
+///
+/// Plan 02-09 tightens the windows per RESEARCH §Q2 step 4 ("If the largest window for
+/// a given budget already saturates the budget, the planner stays with the starting-point
+/// above and notes it" — except the starting points don't fit; tightening is the
+/// alternative):
+///
+/// | Preset   | Window | Hop | Stretch latency | D-25 round-trip budget | Stretch budget |
+/// |----------|--------|-----|-----------------|------------------------|----------------|
+/// | Low      | 768    | 192 | 16.00 ms        | <32 ms                 | <19.3 ms       |
+/// | Balanced | 1024   | 256 | 21.33 ms        | <40 ms                 | <27.3 ms       |
+/// | Quality  | 1536   | 384 | 32.00 ms        | <50 ms                 | <37.3 ms       |
+///
+/// The Stretch budget is `total_budget − 12.7 ms` (RESEARCH §Q2 platform-overhead estimate
+/// for cpal capture+playback in-flight + scheduling slack). All three presets now leave
+/// 3–5 ms of headroom against their respective Stretch budgets. The
+/// `dsp_preset_latency_budget` integration test (Plan 02-09 Task 2) verifies the
+/// construction-time latency stays in budget; the manual checkpoint (Plan 02-09 Task 3)
+/// verifies the live `Telemetry::latency_ms` stays in budget per preset against the actual
+/// measured platform overhead.
+///
+/// ## Quality A/B note
+///
+/// User-ear A/B against the previous (larger-window) starting points is part of the
+/// Plan 02-09 manual checkpoint. If the smaller window audibly degrades the M→F transform
+/// (Pitfall #15), the user files a tighten-budget deferred item OR accepts the new
+/// quality bar. D-25 explicitly allows the latter: "Pick the largest signalsmith
+/// window/hop combo that fits each budget."
 ///
 /// Free function rather than `Preset::window_hop` because [`Preset`] is defined in
 /// `womanizer-core::primitives` (Plan 02-02; Pattern G — fields/types that cross thread
@@ -80,9 +117,9 @@ pub const ENGINE_SR: u32 = SAMPLE_RATE_HZ;
 /// circular crate dep). Rust requires inherent impls to live on the defining crate's type.
 pub fn preset_window_hop(preset: Preset) -> (usize, usize) {
     match preset {
-        Preset::Low => (1024, 256),
-        Preset::Balanced => (2048, 512),
-        Preset::Quality => (3072, 768),
+        Preset::Low => (768, 192),
+        Preset::Balanced => (1024, 256),
+        Preset::Quality => (1536, 384),
     }
 }
 
@@ -481,14 +518,19 @@ pub fn rms_simd(samples: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    /// Smoke test that the locked Preset → (window, hop) pairs match RESEARCH §Q2.
-    /// If Plan 02-04's A/B sprint tightens any of these, update this assertion in
-    /// lock-step with the [`preset_window_hop`] body.
+    /// Smoke test that the locked Preset → (window, hop) pairs match the Plan 02-09
+    /// latency-budget tightening. The original RESEARCH §Q2 starting points
+    /// (1024/256, 2048/512, 3072/768) were tightened to fit the per-preset Stretch
+    /// budgets — see the doc-comment on [`preset_window_hop`] for the math.
+    ///
+    /// If a future plan revises these (e.g. user-ear A/B reveals quality degradation
+    /// and the budget is renegotiated), update this assertion in lock-step with the
+    /// [`preset_window_hop`] body AND `tests/dsp_preset_latency_budget.rs`.
     #[test]
     fn preset_window_hop_pairs_match_research() {
-        assert_eq!(preset_window_hop(Preset::Low), (1024, 256));
-        assert_eq!(preset_window_hop(Preset::Balanced), (2048, 512));
-        assert_eq!(preset_window_hop(Preset::Quality), (3072, 768));
+        assert_eq!(preset_window_hop(Preset::Low), (768, 192));
+        assert_eq!(preset_window_hop(Preset::Balanced), (1024, 256));
+        assert_eq!(preset_window_hop(Preset::Quality), (1536, 384));
     }
 
     /// Construction smoke test for all three presets — verifies the upstream
