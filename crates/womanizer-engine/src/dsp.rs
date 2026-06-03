@@ -195,11 +195,8 @@ impl Stretch48k {
 /// - Per block: `current += alpha * (target - current)` for each of pitch and formant.
 ///
 /// `alpha` is precomputed at construction (a const for fixed BLOCK + tau).
-// Fields are written by `new()` and read by `pitch()` / `formant()` accessors, but `step()`
-// (the only place that mutates them per block) is stubbed out until Plan 02-05 fills in the
-// body. The `alpha` field is read only by the future `step()` body. `#[allow(dead_code)]` is
-// scoped narrowly to this stub-phase struct and will become a no-op once Plan 02-05 lands.
-#[allow(dead_code)]
+// Fields are written by `new()`, read by `pitch()` / `formant()` accessors, and mutated by
+// `step()` (Plan 02-05).
 #[derive(Copy, Clone, Debug)]
 pub struct SmoothedVoiceParams {
     /// Current smoothed pitch multiplier. Initialized to `initial_pitch` from `new()`.
@@ -235,25 +232,26 @@ impl SmoothedVoiceParams {
     }
 
     /// Per-block step. Called by the DSP worker AFTER reading the latest VoiceParams
-    /// snapshot from `triple_buffer<VoiceParams>::Output::read()`. Plan 02-05 fills in:
-    /// ```ignore
-    /// self.pitch_current   += self.alpha * (target_pitch   - self.pitch_current);
-    /// self.formant_current += self.alpha * (target_formant - self.formant_current);
-    /// ```
-    pub fn step(&mut self, _target_pitch: f32, _target_formant: f32) {
-        unimplemented!(
-            "filled in by Plan 02-05 — body is two `current += alpha * (target - current)` lines"
-        )
+    /// snapshot from `triple_buffer<VoiceParams>::Output::read()`. Body is the textbook
+    /// one-pole exponential interpolator: `current += alpha * (target - current)` for
+    /// each of pitch and formant. Two lines, zero allocation, ~6 f32 ops per block.
+    /// Plan 02-05.
+    #[inline]
+    pub fn step(&mut self, target_pitch: f32, target_formant: f32) {
+        self.pitch_current += self.alpha * (target_pitch - self.pitch_current);
+        self.formant_current += self.alpha * (target_formant - self.formant_current);
     }
 
-    /// Read the current smoothed pitch multiplier. Plan 02-05 wires this to
+    /// Read the current smoothed pitch multiplier. Wired by Plan 02-05 to
     /// `Stretch48k::set_transpose(self.smoothed.pitch())` per block.
+    #[inline]
     pub fn pitch(&self) -> f32 {
         self.pitch_current
     }
 
-    /// Read the current smoothed formant multiplier. Plan 02-05 wires this to
+    /// Read the current smoothed formant multiplier. Wired by Plan 02-05 to
     /// `Stretch48k::set_formant(self.smoothed.formant())` per block.
+    #[inline]
     pub fn formant(&self) -> f32 {
         self.formant_current
     }
@@ -274,10 +272,8 @@ impl SmoothedVoiceParams {
 /// The 5 dB hysteresis gap prevents chattering — a level hovering between the two
 /// thresholds cannot toggle the state.
 ///
-/// All fields are written by `new()` and consumed by `update()`, which is stubbed until
-/// Plan 02-05 fills in the body per RESEARCH §Example C. `#[allow(dead_code)]` is scoped
-/// narrowly to this stub-phase struct and becomes a no-op once Plan 02-05 lands.
-#[allow(dead_code)]
+/// All fields are written by `new()` and consumed by `update()` (Plan 02-05) per
+/// RESEARCH §Example C.
 #[derive(Debug)]
 pub struct Gate {
     /// Current open/closed state. `false` at construction → gate starts closed; the first
@@ -320,11 +316,48 @@ impl Gate {
         }
     }
 
-    /// Per-block update. Plan 02-05 fills in the envelope-follower + hysteresis state
-    /// machine per RESEARCH §Example C. Returns `true` when the gate is open (worker
-    /// pushes processed audio) or `false` when closed (worker emits zeros — D-29).
-    pub fn update(&mut self, _raw_input_rms: f32) -> bool {
-        unimplemented!("filled in by Plan 02-05 — body is RESEARCH §Example C verbatim (envelope follower + hysteresis state machine)")
+    /// Per-block update — envelope-follower + hysteresis state machine per RESEARCH
+    /// §Example C. Returns `true` when the gate is open (worker pushes processed audio)
+    /// or `false` when closed (worker emits zeros — D-29). Plan 02-05.
+    ///
+    /// One-pole envelope follower picks `alpha_attack` on a rising raw RMS, `alpha_release`
+    /// on a falling raw RMS — standard attack/release smoothing. Then the hysteresis
+    /// state machine: while open, only close after `smoothed_rms` has stayed below
+    /// `close_threshold` for `hold_open_samples` consecutive samples (BLOCK-quantized).
+    /// While closed, open only when `smoothed_rms` crosses `open_threshold`. The 5 dB gap
+    /// between the two thresholds prevents chatter when the level hovers in the dead zone.
+    #[inline]
+    pub fn update(&mut self, raw_input_rms: f32) -> bool {
+        let alpha = if raw_input_rms > self.smoothed_rms {
+            self.alpha_attack
+        } else {
+            self.alpha_release
+        };
+        self.smoothed_rms += alpha * (raw_input_rms - self.smoothed_rms);
+
+        if self.is_open {
+            if self.smoothed_rms < self.close_threshold {
+                self.samples_since_below = self.samples_since_below.saturating_add(BLOCK);
+                if self.samples_since_below >= self.hold_open_samples {
+                    self.is_open = false;
+                }
+            } else {
+                self.samples_since_below = 0;
+            }
+        } else if self.smoothed_rms > self.open_threshold {
+            self.is_open = true;
+            self.samples_since_below = 0;
+        }
+        self.is_open
+    }
+
+    /// Read the current gate state. Wired by the worker so the post-process `processed.fill(0.0)`
+    /// (D-29 true digital silence) branch can be taken outside the assert_no_alloc closure if
+    /// needed; in Plan 02-05 the worker reads the return value of `update()` directly to avoid
+    /// a second read of self. Plan 02-05.
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        self.is_open
     }
 }
 
@@ -503,5 +536,136 @@ mod tests {
             "no set_formant_factor code call found in src/dsp.rs — Stretch48k::set_formant \
              body has regressed away from delegating to the upstream setter"
         );
+    }
+
+    /// Helper: convert a dBFS level to its linear-amplitude equivalent. Used by the gate
+    /// tests below to express their RMS levels in the same units as D-30's thresholds
+    /// (open at −45 dBFS ≈ 0.005623, close at −50 dBFS ≈ 0.003162).
+    fn dbfs_linear(db: f32) -> f32 {
+        10f32.powf(db / 20.0)
+    }
+
+    /// SmoothedVoiceParams converges to its target within 5% after 20 blocks of constant
+    /// drive (20 * 256 = 5120 samples ≈ 106.6 ms ≈ 3.5 time-constants of the 30 ms decay).
+    ///
+    /// Verifies the one-pole exponential math is wired correctly — without `step()` doing
+    /// anything, the values would stay at their initial 1.0 and the assertion would fire.
+    /// 5% is a generous tolerance for 3.5 τ; the textbook exponential math gives ≈ 3%
+    /// residual at exactly 3.5 τ.
+    #[test]
+    fn smoothed_step_converges_to_target() {
+        let mut s = SmoothedVoiceParams::new(1.0, 1.0, BLOCK, 30.0);
+        let target_pitch = 1.65;
+        let target_formant = 1.18;
+        for _ in 0..20 {
+            s.step(target_pitch, target_formant);
+        }
+        let pitch_err = (s.pitch() - target_pitch).abs() / target_pitch;
+        let formant_err = (s.formant() - target_formant).abs() / target_formant;
+        assert!(
+            pitch_err < 0.05,
+            "SmoothedVoiceParams pitch did not converge within 5% after 20 blocks: \
+             current={}, target={target_pitch}, err={pitch_err}",
+            s.pitch()
+        );
+        assert!(
+            formant_err < 0.05,
+            "SmoothedVoiceParams formant did not converge within 5% after 20 blocks: \
+             current={}, target={target_formant}, err={formant_err}",
+            s.formant()
+        );
+    }
+
+    /// SmoothedVoiceParams precomputes alpha ≈ 0.163 for BLOCK=256 and tau=30 ms at 48 kHz
+    /// per RESEARCH §Q6: `1.0 - exp(-256 / 1440) ≈ 0.16297`. Reads the alpha field via a
+    /// behavioral probe — one `step(1.0, 0.0)` call from `current = 0.0` yields
+    /// `current = alpha * (1.0 - 0.0) = alpha`. This indirectly verifies the constructor
+    /// math without exposing the private field.
+    #[test]
+    fn smoothed_alpha_matches_30ms_tau() {
+        let mut s = SmoothedVoiceParams::new(0.0, 0.0, BLOCK, 30.0);
+        s.step(1.0, 1.0);
+        let observed_alpha = s.pitch();
+        let expected_alpha = 1.0 - (-(BLOCK as f32) / 1440.0).exp();
+        let diff = (observed_alpha - expected_alpha).abs();
+        assert!(
+            diff < 0.001,
+            "SmoothedVoiceParams alpha drift: observed={observed_alpha}, expected={expected_alpha}, diff={diff}"
+        );
+        // And the round number for RESEARCH §Q6 sanity:
+        assert!(
+            (observed_alpha - 0.163).abs() < 0.01,
+            "SmoothedVoiceParams alpha at BLOCK=256, tau=30 ms diverged from the RESEARCH §Q6 \
+             ≈ 0.163 figure: observed={observed_alpha}"
+        );
+    }
+
+    /// Gate opens when smoothed RMS crosses the −45 dBFS open threshold (≈ 0.005623). Feed
+    /// raw RMS at −40 dBFS (= 0.01, well above the threshold) for enough blocks for the
+    /// 10 ms attack envelope to converge; assert `is_open() == true`.
+    #[test]
+    fn gate_opens_above_neg45_dbfs() {
+        let mut g = Gate::new();
+        let raw_rms = dbfs_linear(-40.0);
+        // 40 blocks * 256 samples = 10240 samples ≈ 213 ms — well past 10 ms attack tau
+        // (≈ 4 time-constants of the envelope). Smoothed RMS will sit just under raw_rms.
+        for _ in 0..40 {
+            g.update(raw_rms);
+        }
+        assert!(
+            g.is_open(),
+            "Gate failed to open after sustained raw_rms = {raw_rms} (−40 dBFS, above the −45 dBFS open threshold)"
+        );
+    }
+
+    /// Gate closes when smoothed RMS sits below the −50 dBFS close threshold for the full
+    /// hold-open window (2400 samples ≈ 50 ms). Open the gate first, then sweep to −60 dBFS
+    /// (well below close) for enough blocks for both the release envelope AND the hold-open
+    /// counter to elapse; assert `is_open() == false`.
+    #[test]
+    fn gate_closes_below_neg50_dbfs_with_hold() {
+        let mut g = Gate::new();
+        // Phase 1: open the gate via a loud signal.
+        for _ in 0..40 {
+            g.update(dbfs_linear(-40.0));
+        }
+        assert!(
+            g.is_open(),
+            "precondition: gate must be open before close test"
+        );
+        // Phase 2: switch to a very quiet signal; gate must close after hold-open elapses.
+        // 50 blocks * 256 = 12800 samples — > 2400 hold-open AND > 50 ms release tau.
+        for _ in 0..50 {
+            g.update(dbfs_linear(-60.0));
+        }
+        assert!(
+            !g.is_open(),
+            "Gate failed to close after sustained −60 dBFS for 50 blocks (12800 samples)"
+        );
+    }
+
+    /// Gate hysteresis: a level inside the 5 dB dead zone (between −50 dBFS close and
+    /// −45 dBFS open) must NOT toggle the gate state. Open the gate with a loud signal,
+    /// then sweep to −47 dBFS (between close and open) for ~1 second; assert the gate
+    /// stays open the whole time.
+    #[test]
+    fn gate_hysteresis_intermediate_holds_open() {
+        let mut g = Gate::new();
+        // Phase 1: open the gate.
+        for _ in 0..40 {
+            g.update(dbfs_linear(-40.0));
+        }
+        assert!(g.is_open(), "precondition: gate must be open");
+        // Phase 2: sweep to −47 dBFS (in the hysteresis band) for ~1 second of audio.
+        // 200 blocks * 256 = 51200 samples ≈ 1.067 s — far longer than the 50 ms hold-open;
+        // if the gate were going to close due to hysteresis-band drift it would have already.
+        let mid = dbfs_linear(-47.0);
+        for _ in 0..200 {
+            g.update(mid);
+            assert!(
+                g.is_open(),
+                "Gate closed mid-flight in the hysteresis band (−47 dBFS, between −45 open and −50 close)"
+            );
+        }
     }
 }
