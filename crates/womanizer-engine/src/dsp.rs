@@ -145,28 +145,43 @@ impl Stretch48k {
         self.preset
     }
 
-    /// Per-block DSP. Filled in by Plan 02-04 — body becomes `self.inner.process(input, output);`.
-    /// Upstream docs: zero allocation; raw pointer pass to C++.
-    pub fn process(&mut self, _input: &[f32], _output: &mut [f32]) {
-        unimplemented!("filled in by Plan 02-04 — body is self.inner.process(_input, _output)")
+    /// Per-block DSP — delegates to the upstream phase-vocoder.
+    ///
+    /// Zero allocation per upstream — the wrapper passes raw pointers to the C function.
+    /// Verified safe inside `assert_no_alloc(|| { … })` by `tests/dsp_assert_no_alloc_loop.rs`
+    /// (Plan 02-09). The call IS the per-block DSP hot path; the worker calls this every
+    /// block regardless of bypass state (D-28 warm contract).
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        self.inner.process(input, output);
     }
 
-    /// Set the per-block pitch transpose multiplier. Wraps `set_transpose_factor(m, None)`.
-    /// Plan 02-04 fills in: `self.inner.set_transpose_factor(multiplier, None);`
-    pub fn set_transpose(&mut self, _multiplier: f32) {
-        unimplemented!(
-            "filled in by Plan 02-04 — body is self.inner.set_transpose_factor(_multiplier, None)"
-        )
+    /// Set the per-block pitch transpose multiplier. Wraps
+    /// `Stretch::set_transpose_factor(m, None)` — the second `None` argument disables the
+    /// upstream tonality-tilt feature (we do not expose tonality on this Phase 2 surface).
+    ///
+    /// `debug_assert!` guards against the future Phase 4 import path passing a non-positive
+    /// ratio (V5 input validation per RESEARCH §Security Domain). UI slider ranges (D-23)
+    /// already clamp to `[1.20, 2.00]`; the assert is defense-in-depth.
+    pub fn set_transpose(&mut self, multiplier: f32) {
+        debug_assert!(
+            multiplier > 0.0,
+            "Stretch transpose multiplier must be > 0 (got {multiplier})"
+        );
+        self.inner.set_transpose_factor(multiplier, None);
     }
 
     /// Set the per-block formant multiplier with `compensate_pitch = true` LOCKED per D-24.
-    /// The boolean is intentionally not exposed on this surface so callers cannot defeat
-    /// independent pitch + formant control.
-    /// Plan 02-04 fills in: `self.inner.set_formant_factor(multiplier, true);`
-    pub fn set_formant(&mut self, _multiplier: f32) {
-        unimplemented!(
-            "filled in by Plan 02-04 — body is self.inner.set_formant_factor(_multiplier, true) (D-24 locks compensate_pitch=true)"
-        )
+    ///
+    /// `compensate_pitch=true` is LOCKED per CONTEXT.md D-24 — exposing it as a parameter
+    /// would defeat DSP-01's independent-control contract. The boolean is intentionally
+    /// not exposed on this surface so callers cannot defeat independent pitch + formant
+    /// control. `debug_assert!` guards against a non-positive ratio (V5 input validation).
+    pub fn set_formant(&mut self, multiplier: f32) {
+        debug_assert!(
+            multiplier > 0.0,
+            "Stretch formant multiplier must be > 0 (got {multiplier})"
+        );
+        self.inner.set_formant_factor(multiplier, true);
     }
 }
 
@@ -398,5 +413,95 @@ mod tests {
         assert_eq!(preset_window_hop(Preset::Low), (1024, 256));
         assert_eq!(preset_window_hop(Preset::Balanced), (2048, 512));
         assert_eq!(preset_window_hop(Preset::Quality), (3072, 768));
+    }
+
+    /// Construction smoke test for all three presets — verifies the upstream
+    /// `Stretch::new(1, block, interval)` constructor succeeds for each Preset's STFT
+    /// pair AND that the reported total latency is non-zero (the vocoder must take some
+    /// internal latency) and bounded below 4000 samples (~83 ms @ 48 kHz — well above any
+    /// preset's budget; a regression where preset_default-style construction creeps in
+    /// would trip this).
+    ///
+    /// Protects against:
+    /// - Future signalsmith version drift where construction parameters are silently
+    ///   ignored or mis-applied (e.g., `preset_default` being used instead of explicit
+    ///   `new(1, block, interval)`).
+    /// - A planner accidentally re-introducing a preset whose internal window exceeds the
+    ///   product's hard latency ceiling (80 ms — CLAUDE.md).
+    #[test]
+    fn stretch48k_constructs_for_all_presets() {
+        for preset in [Preset::Low, Preset::Balanced, Preset::Quality] {
+            let s = Stretch48k::new(preset);
+            assert_eq!(s.preset(), preset);
+            let lat = s.latency_samples();
+            assert!(
+                lat > 0,
+                "Stretch48k::new({preset:?}) reported zero latency_samples — \
+                 upstream construction may be a no-op or a future API change zeroed it out"
+            );
+            assert!(
+                lat < 4000,
+                "Stretch48k::new({preset:?}) reported latency_samples={lat} which exceeds \
+                 the 4000-sample (~83 ms @ 48 kHz) ceiling — any preset above this blows the \
+                 80 ms hard latency cap (CLAUDE.md); reject"
+            );
+        }
+    }
+
+    /// Source-level invariant gate: every `set_formant_factor(...)` CODE call in this file
+    /// MUST pass `true` as the second argument (D-24 — compensate_pitch LOCKED).
+    ///
+    /// This is not a behavior test (the upstream Rust API exposes no getter for
+    /// `compensate_pitch` state); it is a structural gate that catches a future planner
+    /// or refactor accidentally swapping the `true` for `false` (which would defeat
+    /// DSP-01's independent-control contract).
+    ///
+    /// Reads its own source file via `CARGO_MANIFEST_DIR`. Skips comment lines (lines whose
+    /// trimmed prefix starts with `//`) — doc-comments naturally mention the symbol as a
+    /// reference. Skips its own needle-literal line by constructing the needle at runtime
+    /// from two string fragments so the whole needle never appears literally on one source
+    /// line. For each remaining CODE line containing the needle, asserts the next 30 chars
+    /// after the open paren contain `, true)`.
+    #[test]
+    fn stretch48k_set_formant_uses_compensate_pitch_true_grep() {
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/dsp.rs");
+        let src = std::fs::read_to_string(&src_path)
+            .expect("must be able to read src/dsp.rs from CARGO_MANIFEST_DIR");
+        // Construct the needle at runtime from two fragments so the assembled string
+        // `set_formant_factor(` does not appear as a literal on any source line of this
+        // test — otherwise the literal here would match itself and trip the assertion.
+        let needle = {
+            let a = "set_formant_";
+            let b = "factor(";
+            format!("{a}{b}")
+        };
+        let mut found_any = false;
+        for (lineno, line) in src.lines().enumerate() {
+            // Skip comment lines (//, ///, //!) — doc-comments may name the symbol as
+            // a reference without being an actual call site.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let Some(idx) = line.find(needle.as_str()) else {
+                continue;
+            };
+            let tail_start = idx + needle.len();
+            // 30 chars is enough to span `multiplier, true)` (~17 chars) plus headroom.
+            let tail_end = (tail_start + 30).min(line.len());
+            let tail = &line[tail_start..tail_end];
+            assert!(
+                tail.contains(", true)"),
+                "set_formant_factor code call on line {} does not pass `, true)` for \
+                 compensate_pitch within the next 30 chars — D-24 LOCK violated. \
+                 Found tail: {tail:?}",
+                lineno + 1
+            );
+            found_any = true;
+        }
+        assert!(
+            found_any,
+            "no set_formant_factor code call found in src/dsp.rs — Stretch48k::set_formant \
+             body has regressed away from delegating to the upstream setter"
+        );
     }
 }
