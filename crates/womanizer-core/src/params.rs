@@ -71,6 +71,32 @@ impl Default for VoiceParams {
     }
 }
 
+impl VoiceParams {
+    /// Pitch multiplier as a frequency ratio for the signalsmith
+    /// `Stretch::set_transpose_factor` setter. Pure-function wrapper around
+    /// [`semitones_to_ratio`] reading `self.pitch_semitones`. RT-safe (zero allocation,
+    /// branchless `exp2`); the DSP worker calls this per audio block via the
+    /// `triple_buffer<VoiceParams>` snapshot path (Plan 02-04 / D-23 + D-35).
+    #[inline]
+    pub fn pitch_semitones_to_ratio(&self) -> f32 {
+        semitones_to_ratio(self.pitch_semitones)
+    }
+
+    /// Formant multiplier as a frequency ratio for the signalsmith
+    /// `Stretch::set_formant_factor` setter. Pure-function wrapper around
+    /// [`semitones_to_ratio`] reading `self.formant_semitones`. RT-safe (zero allocation,
+    /// branchless `exp2`); the DSP worker calls this per audio block via the
+    /// `triple_buffer<VoiceParams>` snapshot path (Plan 02-04 / D-23 + D-35).
+    ///
+    /// Independent of pitch_semitones_to_ratio — that independence is what avoids the
+    /// chipmunk artifact (DSP-01 / D-24 — compensate_pitch=true is locked at the
+    /// Stretch48k boundary).
+    #[inline]
+    pub fn formant_semitones_to_ratio(&self) -> f32 {
+        semitones_to_ratio(self.formant_semitones)
+    }
+}
+
 /// Convert a semitone offset to a frequency ratio: `2^(st/12)`.
 ///
 /// Engine-boundary conversion (D-04) — runs OFF the audio thread when publishing the active

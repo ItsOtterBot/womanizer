@@ -114,7 +114,7 @@ pub fn spawn_dsp_worker(
     mut vo_tx: Producer<AudioFrame>,
     mut mo_tx: Producer<AudioFrame>,
     hot: Arc<HotParams>,
-    mut _snap_out: triple_buffer::Output<VoiceParams>,
+    mut snap_out: triple_buffer::Output<VoiceParams>,
     stop_flag: Arc<AtomicBool>,
 ) -> std::io::Result<(JoinHandle<()>, DspWakeHandle)> {
     // The wake handle must be bound to the DSP worker thread, which doesn't exist yet. Use a
@@ -136,10 +136,24 @@ pub fn spawn_dsp_worker(
 
             // Stack-allocated scratch buffers — never touched by another thread. Allocated
             // once on thread spawn so the inner loop is alloc-free (assert_no_alloc requires
-            // it). Phase 1 only needs `processed` (memcpy passthrough); Phase 2 will use both
-            // for the signalsmith intermediate state.
+            // it). Phase 2: `scratch` holds the raw capture frames; `processed` receives
+            // signalsmith's pitch+formant-shifted output. The bypass branch (D-27/D-28)
+            // selects which of the two goes to vo_tx without ever skipping the process() call.
             let mut scratch = [0f32; BLOCK];
             let mut processed = [0f32; BLOCK];
+
+            // Phase 2 Plan 02-04: construct the signalsmith Stretch instance OFF the audio
+            // callback path (worker spawn time). The Balanced preset is the boot default;
+            // Plan 02-08's `EngineCommand::SetPreset` handler will rebuild the instance
+            // off-RT and hand it in via a bounded crossbeam swap channel. Initial
+            // transpose/formant come from `VoiceParams::default()` (D-22 — pitch ≈ 1.65×,
+            // formant ≈ 1.18×); Plan 02-05's SmoothedVoiceParams will replace the raw
+            // setter calls below with the 30 ms exponential ramp (D-35) to suppress
+            // slider-drag zipper noise (Pitfall #7).
+            let default_voice = VoiceParams::default();
+            let mut stretch = crate::dsp::Stretch48k::new(womanizer_core::Preset::Balanced);
+            stretch.set_transpose(default_voice.pitch_semitones_to_ratio());
+            stretch.set_formant(default_voice.formant_semitones_to_ratio());
             loop {
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
@@ -159,22 +173,41 @@ pub fn spawn_dsp_worker(
                     scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
                     chunk.commit_all();
 
-                    // Phase 1: memcpy passthrough (smoke.rs lines 48-53 verbatim shape).
-                    // The whole DSP body stays inside assert_no_alloc so any future
-                    // regression is caught (AUDIO-10).
-                    //
-                    // Phase 2 will replace the body of this block with a signalsmith
-                    // Stretch call that reads _snap_out for the active voice params; the
-                    // _snap_out underscore-prefix documents that Phase 1 does NOT yet
-                    // dereference it.
-                    assert_no_alloc(|| {
-                        processed[..].copy_from_slice(&scratch);
-                    });
+                    // Read the latest target VoiceParams from the UI's triple_buffer.
+                    // `triple_buffer::Output::read()` returns a `&VoiceParams` borrowed
+                    // from the worker-owned back buffer — pointer-swap semantics, no
+                    // allocation. VoiceParams holds an `Option<String>` (color_tag) so it
+                    // is not `Copy`; we cache the two `f32` ratios we actually need into
+                    // stack locals before entering the assert_no_alloc wrap so the borrow's
+                    // lifetime ends before any further mutation happens. Plan 02-05 will
+                    // route these through SmoothedVoiceParams::step(...) for the 30 ms
+                    // exponential ramp; Plan 02-04 calls the Stretch setters directly so
+                    // DSP-01 is verifiable end-to-end ahead of the smoother landing.
+                    let target = snap_out.read();
+                    let target_pitch_ratio = target.pitch_semitones_to_ratio();
+                    let target_formant_ratio = target.formant_semitones_to_ratio();
 
-                    let _ = vo_tx.push_entire_slice(&processed);
-                    if hot.monitor_enabled.load(Ordering::Relaxed) {
-                        let _ = mo_tx.push_entire_slice(&processed);
-                    }
+                    // D-28 bypass-warm contract: stretch.process() is called UNCONDITIONALLY
+                    // every block so the signalsmith phase-vocoder state stays continuous;
+                    // the bypass branch swaps ONLY which buffer is pushed to vo_tx (raw
+                    // scratch vs processed). Skipping process() during Bypass would leave
+                    // the instance stale and produce a 5–20 ms glitch on toggle-back (RESEARCH
+                    // §Pitfall 4). Both vo_tx and mo_tx receive the same `to_push` so the
+                    // monitor mirrors what the virtual output produces.
+                    assert_no_alloc(|| {
+                        stretch.set_transpose(target_pitch_ratio);
+                        stretch.set_formant(target_formant_ratio);
+                        stretch.process(&scratch, &mut processed);
+                        let to_push: &[f32] = if hot.bypass.load(Ordering::Relaxed) {
+                            &scratch
+                        } else {
+                            &processed
+                        };
+                        let _ = vo_tx.push_entire_slice(to_push);
+                        if hot.monitor_enabled.load(Ordering::Relaxed) {
+                            let _ = mo_tx.push_entire_slice(to_push);
+                        }
+                    });
                 }
             }
         })?;

@@ -61,6 +61,14 @@ regex = { workspace = true }
 serial_test = "3"
 regex = { workspace = true }
 
+# Plan 02-04: dev-only rustfft + num-complex for the dsp_pitch_ratio integration test.
+# rustfft 6.4 is already in the workspace dep tree as a transitive of pitch-detection 0.3
+# (verified via Cargo.lock), so declaring it here as a dev-dep does not add a new
+# top-level crate to the supply chain — it just makes the type available to test code.
+# MIT/Apache-2.0; cargo-deny green. Test-only path → release binary is unaffected.
+rustfft = "6"
+num-complex = "0.4"
+
 # The AUDIO-09 reconnect integration test requires the `test-injection` feature to call
 # EngineHandle::inject_error. Run with `cargo test --features test-injection -p
 # womanizer-engine --test reconnect`. Without the feature, the test target is skipped
