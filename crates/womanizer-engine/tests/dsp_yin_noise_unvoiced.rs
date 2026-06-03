@@ -1,27 +1,37 @@
-//! Wave 0 STUB — requirement DSP-04; filled in by Plan 02-06.
+//! DSP-04 integration test — 512 samples of deterministic white noise (no periodic
+//! structure) must flow through `Yin48k::get_pitch` and return `None`. Validates the
+//! unvoiced branch (clarity < 0.85 per RESEARCH §Q4). Without this gate, YIN would emit
+//! garbage F0 readings for whisper / breath / silence and the UI's `.is_nan()` "—"
+//! rendering (D-32) would never trigger.
 //!
-//! Goal of the real test (per RESEARCH §Q12 / VALIDATION.md Wave 0 Requirements list):
-//! generate 512 samples of white noise (no periodic structure), pass it to
-//! `Yin48k::get_pitch`, and assert the return is `None`. This validates the unvoiced
-//! branch — without it, YIN would emit garbage F0 readings for whisper / breath / silence
-//! and the UI's `.is_nan()` "—" rendering (D-32) would never trigger.
+//! Activated by Plan 02-06 (ignore attribute removed). The lib unit test
+//! `dsp::tests::yin48k_returns_none_for_white_noise` exercises the same body; the
+//! integration version exists for VALIDATION.md's per-requirement command surface
+//! (`cargo test -p womanizer-engine --test dsp_yin_noise_unvoiced`).
 //!
-//! The companion test `dsp_yin_sine_accuracy` covers the voiced branch (220 Hz sine →
-//! 220 ± 2 Hz). Together they pin both sides of the clarity threshold (0.93, D-32).
-//!
-//! No `assert_no_alloc::AllocDisabler` registration in THIS file — Yin48k::get_pitch is
-//! covered for alloc-freedom by `dsp_assert_no_alloc_loop`; this test focuses on the
-//! unvoiced-classification correctness.
-//!
-//! When Plan 02-06 fills in the body it MUST remove the `#[ignore]` attribute below.
+//! Noise generator: a deterministic linear congruential PRNG (classic glibc LCG, a =
+//! 1103515245, c = 12345, seed = 12345) — no `rand` dep needed, fully reproducible.
 
-// `use` keeps the dsp::Yin48k surface live so a future rename breaks this stub at
-// compile time even before Plan 02-06 fills in the body.
-#[allow(unused_imports)]
 use womanizer_engine::dsp::Yin48k;
 
+/// 512-sample YIN window per D-32 (~10 ms @ 48 kHz).
+const WINDOW: usize = 512;
+
 #[test]
-#[ignore = "stub — filled in by Plan 02-06"]
 fn yin_noise_unvoiced() {
-    todo!("Plan 02-06 fills in the body — see RESEARCH §Q12 sketch (512 samples of white noise → Yin48k::get_pitch returns None — validates D-32 unvoiced branch)");
+    // Deterministic LCG white noise → uniform in [-1, 1]. No periodic structure.
+    let mut state: u32 = 12345;
+    let mut window = Vec::with_capacity(WINDOW);
+    for _ in 0..WINDOW {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        window.push((state as i32 as f32) / (i32::MAX as f32));
+    }
+
+    let mut yin = Yin48k::new();
+    let result = yin.get_pitch(&window);
+    assert!(
+        result.is_none(),
+        "Yin48k::get_pitch must return None for white noise (no periodic structure); \
+         got {result:?} — clarity threshold may be too lenient or wrapper is misconfigured"
+    );
 }

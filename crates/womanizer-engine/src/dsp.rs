@@ -50,6 +50,7 @@
 //! `loop { ... }` body, NEVER inside the cpal callback.
 
 use pitch_detection::detector::yin::YINDetector;
+use pitch_detection::detector::PitchDetector;
 use signalsmith_stretch::Stretch;
 
 use crate::cpal_io::{BLOCK, SAMPLE_RATE_HZ};
@@ -377,10 +378,7 @@ impl Default for Gate {
 /// (verified against pitch-detection 0.3.0 source per RESEARCH §Q4). The `padding=0`
 /// argument disables rustfft zero-padding, keeping the hot path tighter.
 ///
-/// `detector` is consumed by the stubbed `get_pitch()` body Plan 02-06 fills in.
-/// `#[allow(dead_code)]` is scoped narrowly to this stub-phase struct and becomes a no-op
-/// once Plan 02-06 lands.
-#[allow(dead_code)]
+/// `detector` is consumed by `get_pitch()` (Plan 02-06 landed the body); fields are live.
 pub struct Yin48k {
     /// The wrapped YIN detector. Owns the pre-allocated BufferPool scratch.
     detector: YINDetector<f32>,
@@ -396,21 +394,29 @@ impl Yin48k {
     }
 
     /// Estimate F0 of a 512-sample window. Returns `Some(hz)` when voiced (clarity above
-    /// threshold), `None` when unvoiced — the UI renders "—" on the unvoiced branch (D-32).
+    /// 0.85), `None` when unvoiced — the UI renders "—" on the unvoiced branch (D-32).
     ///
-    /// Plan 02-06 fills in:
-    /// ```ignore
-    /// use pitch_detection::detector::PitchDetector;
-    /// const POWER_THRESHOLD: f32 = 0.0;
-    /// const CLARITY_THRESHOLD: f32 = 0.93;
-    /// self.detector
-    ///     .get_pitch(signal, ENGINE_SR as usize, POWER_THRESHOLD, CLARITY_THRESHOLD)
-    ///     .map(|p| p.frequency)
-    /// ```
-    pub fn get_pitch(&mut self, _signal: &[f32]) -> Option<f32> {
-        unimplemented!(
-            "filled in by Plan 02-06 — body wraps `self.detector.get_pitch(_signal, ENGINE_SR as usize, 0.0, 0.93).map(|p| p.frequency)`"
-        )
+    /// Per RESEARCH §Q4 — the lower-than-default 0.85 clarity threshold (vs the crate's
+    /// default 0.93) prevents false-unvoiced on low-volume mic input; tune at execute-time
+    /// A/B if false-voiced becomes a problem. `POWER_THRESHOLD = 0.0` disables YIN's
+    /// internal power gate (Phase 2 owns gating via the separate `Gate` state machine —
+    /// D-30; YIN should not also gate).
+    ///
+    /// Allocation profile: `YINDetector::new(512, 0)` pre-allocates a `BufferPool` at
+    /// construction (verified against pitch-detection 0.3.0 source); subsequent `get_pitch`
+    /// calls borrow scratch via `RefCell::borrow_mut()` on the hot path, no heap allocation.
+    /// The worker calls this inside `assert_no_alloc(|| { ... })`.
+    pub fn get_pitch(&mut self, signal: &[f32]) -> Option<f32> {
+        const POWER_THRESHOLD: f32 = 0.0;
+        const CLARITY_THRESHOLD: f32 = 0.85;
+        self.detector
+            .get_pitch(
+                signal,
+                ENGINE_SR as usize,
+                POWER_THRESHOLD,
+                CLARITY_THRESHOLD,
+            )
+            .map(|p| p.frequency)
     }
 }
 
@@ -667,5 +673,111 @@ mod tests {
                 "Gate closed mid-flight in the hysteresis band (−47 dBFS, between −45 open and −50 close)"
             );
         }
+    }
+
+    /// Helper: generate a `len`-sample window of a pure sine at `f_hz` and `amplitude`
+    /// at the engine's 48 kHz sample rate. Mirrors the sine-generator pattern in
+    /// `resampler.rs::tests` (RESEARCH §Q12 / PATTERNS.md identifies the resampler as the
+    /// canonical analog).
+    fn sine_window(f_hz: f32, amplitude: f32, len: usize) -> Vec<f32> {
+        let phase_step = 2.0 * std::f32::consts::PI * f_hz / ENGINE_SR as f32;
+        let mut phase = 0.0f32;
+        let mut out = vec![0f32; len];
+        for s in out.iter_mut() {
+            *s = amplitude * phase.sin();
+            phase += phase_step;
+            if phase > 2.0 * std::f32::consts::PI {
+                phase -= 2.0 * std::f32::consts::PI;
+            }
+        }
+        out
+    }
+
+    /// Helper: deterministic linear congruential PRNG → uniform white noise in [-1, 1].
+    /// Per Plan 02-06 action — use the classic glibc LCG (a=1103515245, c=12345) seeded at
+    /// 12345 so the test is fully reproducible without bringing in a `rand` dep.
+    fn lcg_noise(len: usize) -> Vec<f32> {
+        let mut state: u32 = 12345;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            out.push((state as i32 as f32) / (i32::MAX as f32));
+        }
+        out
+    }
+
+    /// DSP-04 lib test 1: 220 Hz pure sine over 512 samples at 48 kHz → Yin48k returns
+    /// Some(f) with |f - 220| < 2.0 Hz. The 2 Hz tolerance accommodates YIN's parabolic
+    /// interpolation quantization (RESEARCH §Q4) without masking a clarity / power
+    /// threshold regression in the wrapper.
+    #[test]
+    fn yin48k_returns_some_for_220hz_sine() {
+        let window = sine_window(220.0, 0.5, 512);
+        let mut yin = Yin48k::new();
+        let result = yin.get_pitch(&window);
+        let f = result.expect(
+            "Yin48k::get_pitch must return Some for a clean 220 Hz sine — \
+             None here would indicate the clarity threshold is too strict (RESEARCH §Q4)",
+        );
+        let err = (f - 220.0).abs();
+        assert!(
+            err < 2.0,
+            "Yin48k::get_pitch returned {f} Hz for a 220 Hz sine; \
+             error {err} Hz exceeds the 2 Hz YIN-interpolation tolerance"
+        );
+    }
+
+    /// DSP-04 lib test 2: 512 samples of deterministic LCG white noise → Yin48k returns
+    /// None (clarity below 0.85 threshold). Validates the unvoiced branch; without this,
+    /// the worker would falsely store garbage F0 readings for whisper / breath / silence
+    /// and the UI's `.is_nan()` "—" rendering (D-32) would never trigger.
+    #[test]
+    fn yin48k_returns_none_for_white_noise() {
+        let window = lcg_noise(512);
+        let mut yin = Yin48k::new();
+        let result = yin.get_pitch(&window);
+        assert!(
+            result.is_none(),
+            "Yin48k::get_pitch must return None for white noise (no periodic structure); \
+             got {result:?} — clarity threshold may be too lenient or wrapper is misconfigured"
+        );
+    }
+
+    /// Smoke test that `Yin48k::get_pitch` is allocation-free on the hot path. Wraps 100
+    /// consecutive `get_pitch` calls (50 sine, 50 noise — exercises both voiced + unvoiced
+    /// branches and their internal BufferPool::borrow_mut() paths) inside
+    /// `assert_no_alloc(|| { ... })` and asserts the violation counter delta is zero.
+    ///
+    /// This is the lib-side mitigation for T-2-yin-allocation: pitch-detection 0.3.0's
+    /// `YINDetector::new(512, 0)` pre-allocates the BufferPool at construction; the hot
+    /// path borrows from it via `RefCell`. A future crate version that lazily allocates
+    /// on first call would trip this gate. Plan 02-09's `dsp_assert_no_alloc_loop`
+    /// integration test runs the FULL Phase 2 worker body (Stretch + Smoothed + Gate +
+    /// YIN) for 10 s under the global AllocDisabler; this lib smoke is a tighter,
+    /// fast-feedback gate that fires on the YIN call site specifically.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial(no_alloc_violation_counter)]
+    fn yin48k_get_pitch_alloc_free_smoke() {
+        use assert_no_alloc::{assert_no_alloc, violation_count};
+        let voiced = sine_window(220.0, 0.5, 512);
+        let unvoiced = lcg_noise(512);
+        let mut yin = Yin48k::new();
+        let before = violation_count();
+        assert_no_alloc(|| {
+            for _ in 0..50 {
+                let _ = yin.get_pitch(&voiced);
+            }
+            for _ in 0..50 {
+                let _ = yin.get_pitch(&unvoiced);
+            }
+        });
+        let after = violation_count();
+        assert_eq!(
+            after, before,
+            "Yin48k::get_pitch tripped the assert_no_alloc violation counter over 100 \
+             calls — pitch-detection 0.3.x may have introduced lazy allocation on the hot \
+             path (T-2-yin-allocation regression). Pin the exact version in workspace deps."
+        );
     }
 }
