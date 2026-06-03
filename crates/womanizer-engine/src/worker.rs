@@ -168,6 +168,28 @@ pub fn spawn_dsp_worker(
             let mut smoothed =
                 crate::dsp::SmoothedVoiceParams::new(initial_pitch, initial_formant, BLOCK, 30.0);
             let mut gate = crate::dsp::Gate::new();
+
+            // Phase 2 Plan 02-06: construct the Yin48k F0 estimator (D-32) OFF the audio
+            // callback path. The detector pre-allocates a 512-sample BufferPool at
+            // construction; subsequent get_pitch calls borrow from it via RefCell on the
+            // hot path with no heap allocation (verified against pitch-detection 0.3.0
+            // source per RESEARCH §Q4).
+            //
+            // `f0_window` is the worker-owned circular buffer YIN sees on each subsample
+            // tick — updated each block with the latest BLOCK samples (alloc-free
+            // copy_within shift + scratch slice copy), so the YIN call always operates on
+            // a CONTIGUOUS 512-sample window of recent mono audio. Without this, calling
+            // get_pitch on `scratch` alone (256 samples) would assert-fail inside the
+            // pitch-detection crate (YINDetector expects size == construction window).
+            //
+            // `samples_since_f0` is the subsample counter (RESEARCH §Pitfall 5): per-block
+            // YIN at 188 Hz would triple worker CPU usage; D-32 specifies ~30 Hz. We
+            // increment by BLOCK (256) every chunk and only call get_pitch when the
+            // counter crosses F0_INTERVAL_SAMPLES (1600 = 48000 / 30, integer-rounded).
+            let mut yin = crate::dsp::Yin48k::new();
+            let mut f0_window: [f32; 512] = [0.0; 512];
+            let mut samples_since_f0: usize = 0;
+            const F0_INTERVAL_SAMPLES: usize = 1600;
             loop {
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
@@ -186,6 +208,15 @@ pub fn spawn_dsp_worker(
                     scratch[..a.len()].copy_from_slice(a);
                     scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
                     chunk.commit_all();
+
+                    // Phase 2 Plan 02-06: update the circular f0_window with the latest
+                    // BLOCK samples (RESEARCH §Q4 Option 1). `copy_within` is std::slice,
+                    // alloc-free — shifts the oldest BLOCK samples out the front; the
+                    // scratch slice copy fills the tail. After this update, f0_window
+                    // contains the most recent 512 samples of mono input in chronological
+                    // order, ready for the per-tick YIN call inside assert_no_alloc.
+                    f0_window.copy_within(BLOCK..512, 0);
+                    f0_window[512 - BLOCK..].copy_from_slice(&scratch);
 
                     // Read the latest target VoiceParams from the UI's triple_buffer.
                     // `triple_buffer::Output::read()` returns a `&VoiceParams` borrowed
@@ -231,6 +262,34 @@ pub fn spawn_dsp_worker(
                         stretch.process(&scratch, &mut processed);
                         if !gate_open {
                             processed.fill(0.0);
+                        }
+
+                        // Phase 2 Plan 02-06: YIN F0 subsample tick (D-32 ~30 Hz). Runs
+                        // OFF the per-block path — only when the sample counter crosses
+                        // F0_INTERVAL_SAMPLES (1600 ≈ 30 Hz @ 48 kHz). Pitfall #5 — at
+                        // 188 Hz per-block this would triple worker CPU; the counter is
+                        // mandatory. On voiced result: store raw YIN Hz to input_f0_hz
+                        // and (raw * smoothed.pitch()) to output_f0_hz (engineering
+                        // convention per RESEARCH §Open Question 2 — formant shifting
+                        // is an independent timbre operation; the perceived post-shift
+                        // fundamental is the pitch-multiplied input fundamental). On
+                        // unvoiced: store f32::NAN to BOTH fields so the UI's .is_nan()
+                        // check renders "—" (D-32). Relaxed ordering (Pattern C —
+                        // overwrite-latest semantics, single writer).
+                        samples_since_f0 = samples_since_f0.saturating_add(BLOCK);
+                        if samples_since_f0 >= F0_INTERVAL_SAMPLES {
+                            samples_since_f0 = 0;
+                            match yin.get_pitch(&f0_window) {
+                                Some(f0) => {
+                                    tele.input_f0_hz.store(f0, Ordering::Relaxed);
+                                    tele.output_f0_hz
+                                        .store(f0 * smoothed.pitch(), Ordering::Relaxed);
+                                }
+                                None => {
+                                    tele.input_f0_hz.store(f32::NAN, Ordering::Relaxed);
+                                    tele.output_f0_hz.store(f32::NAN, Ordering::Relaxed);
+                                }
+                            }
                         }
 
                         let to_push: &[f32] = if hot.bypass.load(Ordering::Relaxed) {
