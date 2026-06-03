@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use assert_no_alloc::assert_no_alloc;
 use rtrb::{Consumer, Producer};
-use womanizer_core::{AudioFrame, HotParams, VoiceParams};
+use womanizer_core::{AudioFrame, HotParams, Telemetry, VoiceParams};
 
 // Re-export DspWakeHandle so callers can `use womanizer_engine::worker::DspWakeHandle`.
 // The actual type lives in `womanizer-core::wake` (Phase 0 contract).
@@ -114,6 +114,7 @@ pub fn spawn_dsp_worker(
     mut vo_tx: Producer<AudioFrame>,
     mut mo_tx: Producer<AudioFrame>,
     hot: Arc<HotParams>,
+    tele: Arc<Telemetry>,
     mut snap_out: triple_buffer::Output<VoiceParams>,
     stop_flag: Arc<AtomicBool>,
 ) -> std::io::Result<(JoinHandle<()>, DspWakeHandle)> {
@@ -147,13 +148,26 @@ pub fn spawn_dsp_worker(
             // Plan 02-08's `EngineCommand::SetPreset` handler will rebuild the instance
             // off-RT and hand it in via a bounded crossbeam swap channel. Initial
             // transpose/formant come from `VoiceParams::default()` (D-22 — pitch ≈ 1.65×,
-            // formant ≈ 1.18×); Plan 02-05's SmoothedVoiceParams will replace the raw
-            // setter calls below with the 30 ms exponential ramp (D-35) to suppress
-            // slider-drag zipper noise (Pitfall #7).
+            // formant ≈ 1.18×).
             let default_voice = VoiceParams::default();
+            let initial_pitch = default_voice.pitch_semitones_to_ratio();
+            let initial_formant = default_voice.formant_semitones_to_ratio();
             let mut stretch = crate::dsp::Stretch48k::new(womanizer_core::Preset::Balanced);
-            stretch.set_transpose(default_voice.pitch_semitones_to_ratio());
-            stretch.set_formant(default_voice.formant_semitones_to_ratio());
+            stretch.set_transpose(initial_pitch);
+            stretch.set_formant(initial_formant);
+
+            // Phase 2 Plan 02-05: construct the SmoothedVoiceParams 30 ms exponential
+            // interpolator (D-35) and the RMS Gate state machine (D-30) OFF the audio
+            // callback path. The smoother sits between the triple_buffer<VoiceParams>
+            // snapshot read and the Stretch48k setters — raw slider values never reach the
+            // setters directly (Pitfall #7 zipper noise mitigated). The gate reads
+            // `Telemetry::input_rms.load(Relaxed)` once per block (D-31 — gate operates on
+            // input RMS, evaluated off-RT) and the worker overwrites `processed` with
+            // exact zeros when the gate is closed (D-29 true digital silence). Stretch48k
+            // is STILL called every block regardless of gate state (D-28 warm contract).
+            let mut smoothed =
+                crate::dsp::SmoothedVoiceParams::new(initial_pitch, initial_formant, BLOCK, 30.0);
+            let mut gate = crate::dsp::Gate::new();
             loop {
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
@@ -179,10 +193,7 @@ pub fn spawn_dsp_worker(
                     // allocation. VoiceParams holds an `Option<String>` (color_tag) so it
                     // is not `Copy`; we cache the two `f32` ratios we actually need into
                     // stack locals before entering the assert_no_alloc wrap so the borrow's
-                    // lifetime ends before any further mutation happens. Plan 02-05 will
-                    // route these through SmoothedVoiceParams::step(...) for the 30 ms
-                    // exponential ramp; Plan 02-04 calls the Stretch setters directly so
-                    // DSP-01 is verifiable end-to-end ahead of the smoother landing.
+                    // lifetime ends before any further mutation happens.
                     let target = snap_out.read();
                     let target_pitch_ratio = target.pitch_semitones_to_ratio();
                     let target_formant_ratio = target.formant_semitones_to_ratio();
@@ -194,10 +205,34 @@ pub fn spawn_dsp_worker(
                     // the instance stale and produce a 5–20 ms glitch on toggle-back (RESEARCH
                     // §Pitfall 4). Both vo_tx and mo_tx receive the same `to_push` so the
                     // monitor mirrors what the virtual output produces.
+                    //
+                    // Plan 02-05 additions layered on top of the Plan 02-04 pipeline:
+                    //   - smoothed.step(...) interpolates raw slider targets through a
+                    //     30 ms one-pole filter (D-35) so the Stretch setters never see
+                    //     a step discontinuity (Pitfall #7 zipper-noise mitigation).
+                    //   - gate.update(raw_rms) returns the open/closed state; on closed,
+                    //     processed.fill(0.0) overwrites the signalsmith output with true
+                    //     digital zeros (D-29). stretch.process is STILL called above so
+                    //     the phase-vocoder state stays continuous (D-28 warm contract
+                    //     extends across the gate-closed branch — toggling voice on after
+                    //     dead air must not glitch).
+                    //   - Both gate-open and gate-closed branches execute identical work
+                    //     sets (the single `processed.fill(0.0)` overwrite is a slice
+                    //     write with no allocation) — D-31 assert_no_alloc identical-
+                    //     across-branches invariant preserved.
                     assert_no_alloc(|| {
-                        stretch.set_transpose(target_pitch_ratio);
-                        stretch.set_formant(target_formant_ratio);
+                        smoothed.step(target_pitch_ratio, target_formant_ratio);
+                        stretch.set_transpose(smoothed.pitch());
+                        stretch.set_formant(smoothed.formant());
+
+                        let raw_rms = tele.input_rms.load(Ordering::Relaxed);
+                        let gate_open = gate.update(raw_rms);
+
                         stretch.process(&scratch, &mut processed);
+                        if !gate_open {
+                            processed.fill(0.0);
+                        }
+
                         let to_push: &[f32] = if hot.bypass.load(Ordering::Relaxed) {
                             &scratch
                         } else {
@@ -276,6 +311,7 @@ pub fn spawn(
     mo_tx: Producer<AudioFrame>,
     samples_since_wake: Arc<AtomicUsize>,
     hot: Arc<HotParams>,
+    tele: Arc<Telemetry>,
     snap_out: triple_buffer::Output<VoiceParams>,
 ) -> std::io::Result<WorkerHandles> {
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -285,7 +321,7 @@ pub fn spawn(
     // worker out of its `wait()` park-loop (otherwise `join()` deadlocks — see WorkerHandles
     // docs above).
     let (dsp_thread, wake) =
-        spawn_dsp_worker(in_rx, vo_tx, mo_tx, hot, snap_out, stop_flag.clone())?;
+        spawn_dsp_worker(in_rx, vo_tx, mo_tx, hot, tele, snap_out, stop_flag.clone())?;
     let pump_thread = spawn_capture_pump(samples_since_wake, wake.clone(), stop_flag.clone())?;
     Ok(WorkerHandles {
         dsp_thread,

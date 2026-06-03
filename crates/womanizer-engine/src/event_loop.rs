@@ -521,6 +521,7 @@ impl Engine {
             mo_tx,
             samples_since_wake.clone(),
             self.hot.clone(),
+            self.tele.clone(),
             snap_out,
         )
         .map_err(EngineBootError::SpawnWorker)?;
