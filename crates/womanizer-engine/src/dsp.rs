@@ -545,7 +545,7 @@ mod tests {
     ///   ignored or mis-applied (e.g., `preset_default` being used instead of explicit
     ///   `new(1, block, interval)`).
     /// - A planner accidentally re-introducing a preset whose internal window exceeds the
-    ///   product's hard latency ceiling (80 ms — CLAUDE.md).
+    ///   product's hard latency ceiling (80 ms — workspace policy).
     #[test]
     fn stretch48k_constructs_for_all_presets() {
         for preset in [Preset::Low, Preset::Balanced, Preset::Quality] {
@@ -561,7 +561,7 @@ mod tests {
                 lat < 4000,
                 "Stretch48k::new({preset:?}) reported latency_samples={lat} which exceeds \
                  the 4000-sample (~83 ms @ 48 kHz) ceiling — any preset above this blows the \
-                 80 ms hard latency cap (CLAUDE.md); reject"
+                 80 ms hard latency cap (workspace policy); reject"
             );
         }
     }

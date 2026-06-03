@@ -8,7 +8,8 @@ plus breathiness / brightness / de-essing shaping. Imperceptible conversation la
 zero GPU contention, fully offline. An OtterBot product, distributed free.
 
 See `.planning/PROJECT.md` for the full product definition, requirements, and architectural
-constraints. `CLAUDE.md` documents the locked tech-stack pins.
+constraints. Locked tech-stack pin rationale is documented in this `README.md` and inline in
+`Cargo.toml`.
 
 ## Build Prerequisites (Windows)
 
