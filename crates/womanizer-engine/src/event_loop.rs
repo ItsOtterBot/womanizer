@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::Builder;
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use rtrb::{Consumer, Producer, RingBuffer};
 use womanizer_core::{
     DspWakeHandle, EngineCommand, EngineError, EngineEvent, ErrorRing, HotParams, InputRing,
@@ -48,6 +48,7 @@ use crate::cpal_io::{
     self, build_capture_stream, build_virtual_output_stream, EngineStreams, TimestampPair,
     TS_RING_CAPACITY,
 };
+use crate::dsp::Stretch48k;
 use crate::monitor::{FeedbackDetector, MonitorBannerState};
 use crate::resampler::SampleRateState;
 use crate::worker::{self, WorkerHandles};
@@ -303,6 +304,23 @@ struct Engine {
     // [`EngineHandle::publish_voice_params`] on every slider drag — if the slot is `None`
     // (engine Stopped) the publish is a graceful no-op.
     snap_in: Arc<Mutex<Option<triple_buffer::Input<VoiceParams>>>>,
+
+    // --- Phase 2 Plan 02-09 off-RT preset rebuild sender slot (RESEARCH §Q9) ---
+    //
+    // The event loop's `EngineCommand::SetPreset(p)` arm constructs a fresh
+    // `Stretch48k::new(p)` here on the event-loop thread (OFF the audio path) and forwards
+    // it to the DSP worker via `preset_tx.try_send(...)`. The worker drains the channel
+    // once per outer wake-loop iteration via `try_recv()` (OUTSIDE assert_no_alloc) and
+    // hot-swaps the live Stretch instance.
+    //
+    // Capacity is `bounded(1)`: if the user double-clicks a preset before the worker has
+    // drained the previous send, the second `try_send` returns `Err(Full)` and we drop the
+    // new instance silently — the user clicks again. Bounded with try_send guarantees the
+    // event loop never blocks on a slow consumer.
+    //
+    // `Some(sender)` only while streams are Started (the receiver lives in the worker
+    // thread); cleared to `None` on Stop in lock-step with the snap_in slot.
+    preset_tx: Option<Sender<Stretch48k>>,
 }
 
 impl Engine {
@@ -365,16 +383,57 @@ impl Engine {
                     }
                 }
                 Ok(EngineCommand::SetPreset(preset)) => {
-                    // Phase 2 Plan 02-08 wires this to: construct a fresh `Stretch48k` off-RT
-                    // here on the event-loop thread, then hand it to the DSP worker via a
-                    // `crossbeam_channel::bounded::<Stretch48k>(1)` swap channel (RESEARCH §Q9
-                    // — signalsmith-stretch has no in-place reconfigure). Plan 02-02 only
-                    // widens the EngineCommand enum and lands this match arm as a tracing
-                    // log so the build stays exhaustive.
-                    tracing::debug!(
-                        ?preset,
-                        "SetPreset received (Plan 02-08 wiring placeholder)"
-                    );
+                    // Phase 2 Plan 02-09 off-RT preset rebuild (RESEARCH §Q9, D-26).
+                    // signalsmith-stretch exposes no in-place reconfigure — preset change
+                    // means constructing a NEW Stretch48k instance with the preset's
+                    // window/hop pair. The construction happens HERE on the event-loop
+                    // thread (the bindgen-generated C++ constructor may allocate; we are
+                    // OFF the audio thread so allocation is fine).
+                    //
+                    // The handoff uses `crossbeam_channel::bounded::<Stretch48k>(1)` with
+                    // try_send: if the worker hasn't drained the previous instance (rare —
+                    // user clicked twice in < 5.3 ms), the new instance drops silently and
+                    // the user clicks again. NEVER block here — the event-loop thread must
+                    // stay responsive to other commands and the ErrorRing drain tick.
+                    //
+                    // When streams are Stopped (`preset_tx == None`), the SetPreset is a
+                    // graceful no-op — there is no worker to receive it. The next Start
+                    // will boot with `Stretch48k::new(Preset::Balanced)` per worker spawn
+                    // boot config; the UI's `current_preset` mirror state (Plan 02-08)
+                    // continues to reflect the user's most-recent click selection across
+                    // the Stop → Start cycle but does NOT carry through to the engine
+                    // until a fresh Start.
+                    if let Some(tx) = self.preset_tx.as_ref() {
+                        let new_stretch = Stretch48k::new(preset);
+                        match tx.try_send(new_stretch) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    ?preset,
+                                    "SetPreset: new Stretch48k handed to worker"
+                                );
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                tracing::debug!(
+                                    ?preset,
+                                    "SetPreset: worker has not drained previous swap; \
+                                     dropping new instance"
+                                );
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                tracing::warn!(
+                                    ?preset,
+                                    "SetPreset: worker preset_rx disconnected; \
+                                     instance dropped"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            ?preset,
+                            "SetPreset received while engine Stopped; \
+                             no worker to receive (graceful no-op)"
+                        );
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // W8 wiring (Plan 01-05): tick the FeedbackDetector at the same 50 ms
@@ -509,6 +568,15 @@ impl Engine {
         // ---- counters + wake ----
         let samples_since_wake = Arc::new(AtomicUsize::new(0));
 
+        // ---- Phase 2 Plan 02-09 off-RT preset rebuild channel (RESEARCH §Q9) ----
+        //
+        // crossbeam_channel::bounded::<Stretch48k>(1): event-loop side calls try_send when
+        // SetPreset arrives; worker side calls try_recv once per outer wake-loop iteration
+        // OUTSIDE assert_no_alloc. Capacity 1 is a deliberate trade — preset clicks are
+        // < 1 Hz human-interaction rate; if the worker hasn't drained a previous instance
+        // (rare), drop the new instance silently rather than block the event loop.
+        let (preset_tx, preset_rx) = bounded::<Stretch48k>(1);
+
         // Spawn worker threads. `worker::spawn` internally constructs the wake handle bound
         // to the spawned DSP worker thread (see `spawn_dsp_worker` for the one-shot channel
         // that hands the thread's `Thread` handle back to the caller so the wake's
@@ -523,8 +591,13 @@ impl Engine {
             self.hot.clone(),
             self.tele.clone(),
             snap_out,
+            preset_rx,
         )
         .map_err(EngineBootError::SpawnWorker)?;
+
+        // Stash the sender half. SetPreset arrivals while the engine is Started will route
+        // through this; on Stop, the slot clears back to `None` in lock-step with snap_in.
+        self.preset_tx = Some(preset_tx);
 
         // The `engine_wake` clone passed into the cpal error_callbacks. In Phase 1 the
         // engine event loop does NOT park (recv_timeout(50ms) wakes naturally on its own
@@ -723,6 +796,13 @@ impl Engine {
         if let Ok(mut g) = self.snap_in.lock() {
             *g = None;
         }
+
+        // Plan 02-09: clear the preset_tx sender slot in lock-step with snap_in. The
+        // worker thread (now joined) owned the matching Receiver; sending on this Sender
+        // would just `Err(Disconnected)`. Subsequent SetPreset commands while the engine
+        // is Stopped become graceful no-ops via the `if let Some(tx) = self.preset_tx`
+        // guard in the SetPreset arm.
+        self.preset_tx = None;
     }
 
     /// Drain ALL error-ring consumers (injection + capture + virtual-output) into
@@ -932,6 +1012,7 @@ pub fn spawn(
         feedback_detector: None,
         repaint: repaint.clone(),
         snap_in: snap_in.clone(),
+        preset_tx: None,
     };
 
     // IN-02: wrap engine.run() in catch_unwind so a panic on the engine thread surfaces as

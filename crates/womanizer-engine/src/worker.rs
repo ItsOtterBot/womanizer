@@ -41,8 +41,11 @@ use std::thread::{Builder, JoinHandle};
 use std::time::Duration;
 
 use assert_no_alloc::assert_no_alloc;
+use crossbeam_channel::Receiver;
 use rtrb::{Consumer, Producer};
 use womanizer_core::{AudioFrame, HotParams, Telemetry, VoiceParams};
+
+use crate::dsp::Stretch48k;
 
 // Re-export DspWakeHandle so callers can `use womanizer_engine::worker::DspWakeHandle`.
 // The actual type lives in `womanizer-core::wake` (Phase 0 contract).
@@ -116,6 +119,7 @@ pub fn spawn_dsp_worker(
     hot: Arc<HotParams>,
     tele: Arc<Telemetry>,
     mut snap_out: triple_buffer::Output<VoiceParams>,
+    preset_rx: Receiver<Stretch48k>,
     stop_flag: Arc<AtomicBool>,
 ) -> std::io::Result<(JoinHandle<()>, DspWakeHandle)> {
     // The wake handle must be bound to the DSP worker thread, which doesn't exist yet. Use a
@@ -199,6 +203,29 @@ pub fn spawn_dsp_worker(
                 wake.wait();
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
+                }
+                // Phase 2 Plan 02-09: off-RT preset rebuild swap (RESEARCH §Q9, D-26). The
+                // event_loop's `EngineCommand::SetPreset` handler constructs a fresh
+                // `Stretch48k::new(p)` OFF the audio thread and sends it via a
+                // `crossbeam_channel::bounded::<Stretch48k>(1)` channel. The worker drains
+                // the channel once per outer wake-loop iteration (NOT once per block —
+                // preset changes are < 1 Hz) OUTSIDE the assert_no_alloc block.
+                //
+                // On a successful swap, we reseed the new Stretch instance's setter state
+                // from the current `smoothed` SmoothedVoiceParams so the user does not hear
+                // a glitch at the moment of switching (the new instance's internal
+                // multipliers would otherwise default to 1.0/1.0 → first-block click).
+                //
+                // The OLD Stretch instance drops HERE on the worker thread. The signalsmith
+                // C++ destructor may free internal STFT buffers — this is OUTSIDE
+                // assert_no_alloc, so the strict no-alloc contract is preserved. The free
+                // is a few hundred bytes well within the ~5.3 ms (BLOCK=256) per-iteration
+                // worker budget; we have ample headroom even on a slow CPU.
+                if let Ok(new_stretch) = preset_rx.try_recv() {
+                    let mut s = new_stretch;
+                    s.set_transpose(smoothed.pitch());
+                    s.set_formant(smoothed.formant());
+                    stretch = s;
                 }
                 // Drain all available BLOCK-sized chunks. The capture-pump thread waits for
                 // at least BLOCK samples before waking, so the first read_chunk(BLOCK) call
@@ -372,6 +399,7 @@ pub fn spawn(
     hot: Arc<HotParams>,
     tele: Arc<Telemetry>,
     snap_out: triple_buffer::Output<VoiceParams>,
+    preset_rx: Receiver<Stretch48k>,
 ) -> std::io::Result<WorkerHandles> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     // spawn_dsp_worker constructs the wake handle bound to the spawned DSP thread; the pump
@@ -379,8 +407,16 @@ pub fn spawn(
     // is stashed on WorkerHandles so the Stop handler can `wake.wake()` to break the DSP
     // worker out of its `wait()` park-loop (otherwise `join()` deadlocks — see WorkerHandles
     // docs above).
-    let (dsp_thread, wake) =
-        spawn_dsp_worker(in_rx, vo_tx, mo_tx, hot, tele, snap_out, stop_flag.clone())?;
+    let (dsp_thread, wake) = spawn_dsp_worker(
+        in_rx,
+        vo_tx,
+        mo_tx,
+        hot,
+        tele,
+        snap_out,
+        preset_rx,
+        stop_flag.clone(),
+    )?;
     let pump_thread = spawn_capture_pump(samples_since_wake, wake.clone(), stop_flag.clone())?;
     Ok(WorkerHandles {
         dsp_thread,
