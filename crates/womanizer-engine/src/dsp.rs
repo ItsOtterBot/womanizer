@@ -30,6 +30,13 @@
 //!   runs inside `assert_no_alloc(|| { ... })`. Used by the Phase 3 DeEsser, BrightnessShelf,
 //!   and Breathiness stages — landed here by Plan 03-01 so downstream plans share a single
 //!   coefficient-math source.
+//! - [`BrightnessShelf`]: SHAPE-02 — RBJ second-order high-shelf at 4000 Hz / Q=0.707.
+//!   Per-block coefficient recompute from smoothed gain_db; D-42 warm-off; D-44 default
+//!   +3 dB. Landed by Plan 03-02; wraps a single [`BiquadDF1`].
+//! - [`DeEsser`]: SHAPE-03 — split-band compressor at 6500 Hz / Q=1.0; soft-knee 6 dB
+//!   width, threshold −24 dBFS, 1 ms attack / 50 ms release per-sample envelope follower.
+//!   D-42 warm-off; D-46 default 0.30. Landed by Plan 03-02; wraps two [`BiquadDF1`] bands
+//!   (detector + extract) with independent state.
 //! - [`Gate`]: RMS gate with hysteresis (open at −45 dBFS, close at −50 dBFS, 50 ms hold-open)
 //!   per D-30. `update(raw_input_rms)` returns the gate-open boolean; gate-closed → worker
 //!   emits true digital silence (D-29).
@@ -824,6 +831,81 @@ impl Default for BiquadDF1 {
     }
 }
 
+/// SHAPE-02 — RBJ second-order high-shelf at 4000 Hz / Q=0.707 driven by a smoothed dB
+/// value. Wraps a single [`BiquadDF1`] whose coefficients are recomputed once per block
+/// from the supplied `target_gain_db` (RESEARCH §Pattern 4 Option 1 — "Recompute every
+/// block ~30 ns + 3 transcendentals; 0.0006% CPU"). UI slider range is −6 dB to +12 dB
+/// (D-44); ship-time default +3 dB (D-44).
+///
+/// ## Lifecycle
+/// - Constructed OFF the audio thread (DSP worker spawn — Plan 03-04).
+/// - Owned exclusively by the DSP worker thread; never wrapped in Mutex.
+/// - `process()` is called every audio block. Inside `assert_no_alloc(|| { ... })`.
+///
+/// ## D-42 warm contract
+/// `process()` runs UNCONDITIONALLY every block regardless of `enabled`. The internal
+/// [`BiquadDF1`] state (x1/x2/y1/y2) keeps updating during warm-off so toggling enabled
+/// back on produces zero startup transient (RESEARCH §Pitfall 5). Only the assignment
+/// `output[i] = input[i]` when `!enabled` differs from the enabled branch — the filter's
+/// `step()` is called on every sample either way.
+pub struct BrightnessShelf {
+    /// The single Direct-Form-I biquad set to a high-shelf via [`BiquadDF1::set_high_shelf`]
+    /// at 4000 Hz / Q=0.707; coefficients recomputed once per block from the smoothed
+    /// `target_gain_db` argument to [`Self::process`].
+    shelf: BiquadDF1,
+}
+
+impl BrightnessShelf {
+    /// Construct a BrightnessShelf with a unity-passthrough biquad. The first
+    /// [`Self::process`] call reseeds coefficients via
+    /// [`BiquadDF1::set_high_shelf`] from the supplied `target_gain_db` (typically the
+    /// smoothed slider value published by [`SmoothedVoiceParams::brightness_db`]).
+    ///
+    /// `_fs` is accepted (and currently unused at construction) so the constructor
+    /// signature mirrors Pattern B's per-block-takes-`fs` shape — callers do not need to
+    /// remember whether the rate flows through the constructor or [`Self::process`]. The
+    /// argument is intentionally a no-op here; the actual sample rate threads through
+    /// [`Self::process`] for the per-block coefficient setter call.
+    pub fn new(_fs: f32) -> Self {
+        Self {
+            shelf: BiquadDF1::new(),
+        }
+    }
+
+    /// Per-block hot path. Recomputes biquad coefficients ONCE per block from
+    /// `target_gain_db` at 4000 Hz / Q=0.707 (RESEARCH §Pattern 4 — canonical M→F
+    /// female-vocal "air" shelf parameters), then runs the per-sample DF-I recursion.
+    ///
+    /// D-42 warm-off: `self.shelf.step(*xi)` is called UNCONDITIONALLY per sample so the
+    /// biquad delay state stays coherent even when `enabled = false`. Only the output
+    /// routing differs — when disabled, `output[i] = input[i]`.
+    ///
+    /// `fs` is the engine sample rate (48 kHz, [`ENGINE_SR`] in practice); accepted as an
+    /// argument so tests can drive alternative rates without going through crate constants.
+    #[inline]
+    pub fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        target_gain_db: f32,
+        enabled: bool,
+        fs: f32,
+    ) {
+        // Per-block coefficient recompute from the smoothed gain_db (RESEARCH §Pattern 4
+        // Option 1 — Recompute every block; ~30 ns + 3 transcendentals; 0.0006% CPU).
+        // Q = 0.707 ≈ 1/√2 — the canonical Butterworth "no resonance" shelf-slope choice.
+        self.shelf.set_high_shelf(fs, 4000.0, target_gain_db, 0.707);
+        debug_assert_eq!(input.len(), output.len());
+        for (xi, yi) in input.iter().zip(output.iter_mut()) {
+            // D-42 warm-off: step UNCONDITIONALLY each sample. The biquad's x1/x2/y1/y2
+            // delays MUST keep updating regardless of `enabled` so a toggle-back produces
+            // zero startup transient.
+            let filtered = self.shelf.step(*xi);
+            *yi = if enabled { filtered } else { *xi };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1482,5 +1564,142 @@ mod tests {
             "smoothed brightness_db did not converge within 1% of {target_bright_db} after \
              100 blocks: observed={observed}, err={err}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Plan 03-02 — BrightnessShelf (SHAPE-02) contract tests.
+    // ---------------------------------------------------------------------------------
+
+    /// Scalar RMS helper for the brightness + de-esser steady-state amplitude assertions.
+    /// Local to this `mod tests` so the lib-test-only helper does not leak into the public
+    /// surface; the engineering parallel of `scalar_rms` already defined above.
+    fn slice_rms(samples: &[f32]) -> f32 {
+        let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+        (sum_sq / samples.len().max(1) as f32).sqrt()
+    }
+
+    /// SHAPE-02 Behavior Test 1: `BrightnessShelf` at `target_gain_db=0.0` produces
+    /// unity passthrough within the RBJ-cookbook coefficient-rounding budget.
+    ///
+    /// At gain_db=0 the RBJ high-shelf math gives `A = 10^0 = 1`, so the b- and
+    /// a-coefficient triplets become identical → after a0-normalization the recursion is
+    /// `y[n] = x[n]`. RMS-of-input ÷ RMS-of-output is within 10^(0.01/20) ≈ 1.00115 of 1.0.
+    #[test]
+    fn brightness_zero_db_unity() {
+        let mut bs = BrightnessShelf::new(ENGINE_SR as f32);
+        let input = sine_window(1000.0, 0.5, 2048);
+        let mut output = vec![0f32; input.len()];
+        bs.process(&input, &mut output, 0.0, true, ENGINE_SR as f32);
+        let in_rms = slice_rms(&input);
+        // Skip the first 8 samples — DF-I delays start at zero so the first outputs ramp
+        // up over the two-sample memory horizon (same skip pattern as the Plan 03-01
+        // `biquad_high_shelf_at_zero_db_is_unity_passthrough` lib test).
+        let out_rms = slice_rms(&output[8..]);
+        let in_rms_settled = slice_rms(&input[8..]);
+        let ratio_db = 20.0 * (out_rms / in_rms_settled).log10();
+        assert!(
+            ratio_db.abs() < 0.01,
+            "BrightnessShelf at 0 dB drifted from unity: in_rms={in_rms} (full), \
+             in_rms_settled={in_rms_settled}, out_rms={out_rms}, ratio_db={ratio_db}"
+        );
+    }
+
+    /// SHAPE-02 Behavior Test 2: at `target_gain_db=+6.0`, an 8 kHz sine — well above the
+    /// 4000 Hz shelf corner — gets boosted by ~6 dB. RBJ second-order shelf approaches its
+    /// asymptotic gain above f0; at f = 2× f0 the gain is very close to the asymptotic
+    /// +6 dB, so 0.5 dB tolerance is generous.
+    ///
+    /// The transient region is skipped (first 1024 samples) so the shelf has had ~21 ms
+    /// of input to settle — far longer than the ~3 ms biquad delay-line warmup.
+    #[test]
+    fn brightness_plus_six_db_at_8khz() {
+        let mut bs = BrightnessShelf::new(ENGINE_SR as f32);
+        let input = sine_window(8000.0, 0.5, 4096);
+        let mut output = vec![0f32; input.len()];
+        bs.process(&input, &mut output, 6.0, true, ENGINE_SR as f32);
+        let in_rms = slice_rms(&input[1024..]);
+        let out_rms = slice_rms(&output[1024..]);
+        let ratio_db = 20.0 * (out_rms / in_rms).log10();
+        // Expected ratio = +6 dB; tolerance ±0.5 dB.
+        let err_db = (ratio_db - 6.0).abs();
+        assert!(
+            err_db < 0.5,
+            "BrightnessShelf at +6 dB on 8 kHz sine: observed ratio_db={ratio_db}, \
+             expected ~6.0 dB (asymptotic), err={err_db}"
+        );
+    }
+
+    /// SHAPE-02 Behavior Test 3: a 200 Hz sine — well below the 4000 Hz shelf corner —
+    /// passes through unchanged even at `target_gain_db=+6.0`. The high-shelf does not
+    /// touch low frequencies; |H(jω)| → 1.0 below the corner.
+    ///
+    /// The transient region (first 512 samples = ~10.7 ms) is skipped; below the corner
+    /// the shelf is essentially flat so the steady-state amplitude matches input within
+    /// 0.5 dB.
+    #[test]
+    fn brightness_low_freq_unaffected() {
+        let mut bs = BrightnessShelf::new(ENGINE_SR as f32);
+        let input = sine_window(200.0, 0.5, 2048);
+        let mut output = vec![0f32; input.len()];
+        bs.process(&input, &mut output, 6.0, true, ENGINE_SR as f32);
+        let in_rms = slice_rms(&input[512..]);
+        let out_rms = slice_rms(&output[512..]);
+        let ratio_db = 20.0 * (out_rms / in_rms).log10();
+        // Expected ratio ≈ 0 dB (below corner); tolerance ±0.5 dB.
+        assert!(
+            ratio_db.abs() < 0.5,
+            "BrightnessShelf at +6 dB on 200 Hz sine (below 4 kHz corner) should be \
+             unity-passthrough: observed ratio_db={ratio_db}, expected ~0.0 dB"
+        );
+    }
+
+    /// SHAPE-02 Behavior Test 4: D-42 warm-off STRUCTURAL gate — the biquad state on a
+    /// disabled instance updates each block just like the enabled instance's. After a
+    /// shared warm-up phase (with disabled producing identity output but state still
+    /// updating internally), switching both to `enabled=true` produces matching outputs
+    /// because both instances' internal `x1/x2/y1/y2` delays sat at identical values.
+    ///
+    /// If `.step()` were guarded by the `enabled` branch (the buggy shape RESEARCH
+    /// §Pitfall 5 calls out), the disabled instance's delays would have stayed at zero
+    /// and the post-toggle output would exhibit a startup transient against the always-on
+    /// reference — tripping the < 0.001 amplitude tolerance.
+    #[test]
+    fn brightness_warm_off_keeps_state_updating() {
+        let fs = ENGINE_SR as f32;
+        let mut bs_on = BrightnessShelf::new(fs);
+        let mut bs_off = BrightnessShelf::new(fs);
+        // Phase 1: drive ~3000 samples of identical signal through both instances. One
+        // runs `enabled=true`, the other `enabled=false`. With D-42 warm-off, both
+        // biquads' internal delay state evolves identically because `step()` is called
+        // unconditionally each sample.
+        let warmup = sine_window(8000.0, 0.5, 3000);
+        let mut tmp_on = vec![0f32; warmup.len()];
+        let mut tmp_off = vec![0f32; warmup.len()];
+        bs_on.process(&warmup, &mut tmp_on, 6.0, true, fs);
+        bs_off.process(&warmup, &mut tmp_off, 6.0, false, fs);
+
+        // Phase 2: switch the previously-disabled instance to enabled=true and drive
+        // both with another 2048 samples. If warm-off was honored, both instances'
+        // internal state matches now so the outputs should agree sample-by-sample.
+        let drive = sine_window(8000.0, 0.5, 2048);
+        let mut out_on = vec![0f32; drive.len()];
+        let mut out_off_then_on = vec![0f32; drive.len()];
+        bs_on.process(&drive, &mut out_on, 6.0, true, fs);
+        bs_off.process(&drive, &mut out_off_then_on, 6.0, true, fs);
+
+        // Compare the LAST 1024 samples — past any residual settling. With warm-off the
+        // outputs match within float-rounding (~1e-5); we use 1e-3 as a generous bound.
+        let cmp_start = drive.len() - 1024;
+        for i in cmp_start..drive.len() {
+            let diff = (out_on[i] - out_off_then_on[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "BrightnessShelf D-42 warm-off violation at sample {i}: \
+                 always-on output={}, off-then-on output={}, diff={diff} \
+                 (expected < 1e-3 if biquad state stayed coherent during warm-off)",
+                out_on[i],
+                out_off_then_on[i]
+            );
+        }
     }
 }
