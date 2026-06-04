@@ -272,6 +272,89 @@ pub fn render(state: &mut ReadyState, _ctx: &egui::Context, ui: &mut egui::Ui) {
         }
     });
 
+    // -------- Phase 3 Plan 03-05: shaping toggle + slider rows (D-37 layout, D-44..D-47) --
+    //
+    // Inserted BETWEEN the preset segmented row (above) and the live meters block (below)
+    // per D-37. Each row: [☐ enable] [stage name] [slider] [value label]. On .changed() the
+    // row updates state and calls publish_voice_params() — slider drags ride the existing
+    // triple_buffer<VoiceParams> publish path (Pattern E channel discipline preserved —
+    // never cmd_tx for high-frequency parameter streams). The DSP worker's
+    // SmoothedVoiceParams (D-35 30 ms tau, widened by Plan 03-01 to cover the four new
+    // continuous params) prevents zipper noise. The three bool enables are NOT smoothed —
+    // D-42 warm-off on the worker handles the transient.
+    //
+    // D-47 note: dry/wet has NO toggle (mix=0 IS off). Three checkbox rows + one
+    // toggle-less row. Phase 4's voice editor (VOICE-03) absorbs these widgets directly;
+    // Phase 3 ships them as the temporary in-place tuning row matching the D-23/D-26
+    // precedent (CONTEXT D-36).
+    //
+    // Slider value labels per D-38: plain 0–1 for breathiness / sibilance / dry-wet
+    // (text(""), no unit), "dB" for brightness — UI self-documents against REQUIREMENTS.md.
+
+    // Breathiness row (D-45 default 0.20 ON; range 0..=1.0)
+    ui.horizontal(|ui| {
+        let mut enabled = state.breathiness_enabled;
+        if ui.checkbox(&mut enabled, "Breathiness").changed() {
+            state.breathiness_enabled = enabled;
+            state.publish_voice_params();
+        }
+        let mut amount = state.breathiness;
+        if ui
+            .add(egui::Slider::new(&mut amount, 0.0..=1.0).text(""))
+            .changed()
+        {
+            state.breathiness = amount;
+            state.publish_voice_params();
+        }
+    });
+
+    // Brightness row (D-44 default +3.0 dB ON; range -6.0..=12.0 dB)
+    ui.horizontal(|ui| {
+        let mut enabled = state.brightness_enabled;
+        if ui.checkbox(&mut enabled, "Brightness").changed() {
+            state.brightness_enabled = enabled;
+            state.publish_voice_params();
+        }
+        let mut db = state.brightness_db;
+        if ui
+            .add(egui::Slider::new(&mut db, -6.0..=12.0).text("dB"))
+            .changed()
+        {
+            state.brightness_db = db;
+            state.publish_voice_params();
+        }
+    });
+
+    // Sibilance-tame row (D-46 default 0.30 ON; range 0..=1.0)
+    ui.horizontal(|ui| {
+        let mut enabled = state.sibilance_tame_enabled;
+        if ui.checkbox(&mut enabled, "Sibilance-tame").changed() {
+            state.sibilance_tame_enabled = enabled;
+            state.publish_voice_params();
+        }
+        let mut amount = state.sibilance_tame;
+        if ui
+            .add(egui::Slider::new(&mut amount, 0.0..=1.0).text(""))
+            .changed()
+        {
+            state.sibilance_tame = amount;
+            state.publish_voice_params();
+        }
+    });
+
+    // Dry/Wet row (D-47 default 1.0; range 0..=1.0; NO toggle — mix=0 IS off)
+    ui.horizontal(|ui| {
+        ui.label("Dry/Wet:");
+        let mut mix = state.mix;
+        if ui
+            .add(egui::Slider::new(&mut mix, 0.0..=1.0).text(""))
+            .changed()
+        {
+            state.mix = mix;
+            state.publish_voice_params();
+        }
+    });
+
     // -------- Live meters (read each repaint at 30 Hz) --------
     ui.label(format!(
         "Latency: {:.1} ms",
