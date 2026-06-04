@@ -134,6 +134,32 @@ pub struct ReadyState {
     /// `EngineCommand::SetPreset(p)` over `cmd_tx`; the off-RT rebuild handler that
     /// actually swaps the warm `Stretch48k` instance lands in Plan 02-09.
     pub current_preset: Preset,
+    /// Phase 3 (Plan 03-05, D-45) UI mirror of the breathiness amount slider. Range `0..=1.0`.
+    /// Seeded from `VoiceParams::default()` (D-45 ship value 0.20). On slider drag, the new
+    /// value is stored here and `publish_voice_params` writes a fresh `VoiceParams` snapshot
+    /// via `handle.snap_in` (triple_buffer publish path; Pattern E — no cmd_tx for sliders).
+    pub breathiness: f32,
+    /// Phase 3 (Plan 03-05, D-45) UI mirror of the breathiness enable toggle. Seeded from
+    /// `VoiceParams::default()` (D-45 default `true`). D-42 warm-off semantics on the worker
+    /// side — when `false`, the Breathiness stage's biquad + PRNG + envelope still update
+    /// each block; only the noise-add to the output is bypassed.
+    pub breathiness_enabled: bool,
+    /// Phase 3 (Plan 03-05, D-44) UI mirror of the brightness high-shelf gain slider. Range
+    /// `-6.0..=12.0` dB. Seeded from `VoiceParams::default()` (D-44 ship value +3.0 dB).
+    pub brightness_db: f32,
+    /// Phase 3 (Plan 03-05, D-44) UI mirror of the brightness enable toggle. Seeded from
+    /// `VoiceParams::default()` (D-44 default `true`). D-42 warm-off semantics on the worker.
+    pub brightness_enabled: bool,
+    /// Phase 3 (Plan 03-05, D-46) UI mirror of the sibilance-tame amount slider. Range `0..=1.0`.
+    /// Seeded from `VoiceParams::default()` (D-46 ship value 0.30).
+    pub sibilance_tame: f32,
+    /// Phase 3 (Plan 03-05, D-46) UI mirror of the sibilance-tame enable toggle. Seeded from
+    /// `VoiceParams::default()` (D-46 default `true`). D-42 warm-off semantics on the worker.
+    pub sibilance_tame_enabled: bool,
+    /// Phase 3 (Plan 03-05, D-47) UI mirror of the dry/wet mix slider. Range `0..=1.0`. Seeded
+    /// from `VoiceParams::default()` (D-47 ship value 1.0 — fully wet). NO enable toggle per
+    /// D-47 (mix=0.0 IS the off state — RESEARCH §Open Question 3).
+    pub mix: f32,
 }
 
 impl ReadyState {
@@ -161,6 +187,16 @@ impl ReadyState {
             pitch_slider,
             formant_slider,
             current_preset: Preset::Balanced,
+            // Phase 3 (Plan 03-05) new fields seeded from VoiceParams::default() (D-44..D-47)
+            // — NOT hardcoded literals — so any future tuning to ship-time defaults in
+            // womanizer-core::params propagates here automatically (Plan 02-08 discipline).
+            breathiness: defaults.breathiness,
+            breathiness_enabled: defaults.breathiness_enabled,
+            brightness_db: defaults.brightness_db,
+            brightness_enabled: defaults.brightness_enabled,
+            sibilance_tame: defaults.sibilance_tame,
+            sibilance_tame_enabled: defaults.sibilance_tame_enabled,
+            mix: defaults.mix,
         }
     }
 
@@ -172,13 +208,29 @@ impl ReadyState {
     ///
     /// Pitch / formant mirror values are ratios (the slider ranges are ratios per D-23);
     /// `VoiceParams` stores semitones (D-04), so we round-trip via `12 * log2(ratio)`.
-    /// All other `VoiceParams` fields stay at their `Default` values for Phase 2 — Phase 4
-    /// adds the editor UI that lets the user edit breathiness / brightness / sibilance /
-    /// mix; Phase 2 only exposes pitch + formant.
+    ///
+    /// Phase 3 (Plan 03-05, D-37 + D-44..D-47): the four shaping continuous params
+    /// (`breathiness`, `brightness_db`, `sibilance_tame`, `mix`) plus the three enable
+    /// toggles (`breathiness_enabled`, `brightness_enabled`, `sibilance_tame_enabled`)
+    /// ride the same per-block `triple_buffer<VoiceParams>` snapshot path — Pattern E
+    /// channel discipline preserved (no `cmd_tx` for high-frequency parameter streams).
+    /// The worker's `SmoothedVoiceParams` (D-35 30 ms tau, widened by Plan 03-01 to
+    /// cover the four continuous fields) prevents zipper noise on slider drags; the
+    /// three enables are NOT smoothed (D-42 warm-off on the worker handles the
+    /// transient). The `..VoiceParams::default()` spread at the end keeps `compensate_pitch`
+    /// (D-24), `quality_preset`, and `color_tag` at their default values for Phase 3 —
+    /// Phase 4's voice editor owns the persistent voice library and per-field edits.
     pub fn publish_voice_params(&self) {
         let params = womanizer_core::VoiceParams {
             pitch_semitones: 12.0 * self.pitch_slider.log2(),
             formant_semitones: 12.0 * self.formant_slider.log2(),
+            breathiness: self.breathiness,
+            breathiness_enabled: self.breathiness_enabled,
+            brightness_db: self.brightness_db,
+            brightness_enabled: self.brightness_enabled,
+            sibilance_tame: self.sibilance_tame,
+            sibilance_tame_enabled: self.sibilance_tame_enabled,
+            mix: self.mix,
             ..womanizer_core::VoiceParams::default()
         };
         self.handle.publish_voice_params(params);
