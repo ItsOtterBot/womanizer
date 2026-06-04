@@ -44,6 +44,20 @@ pub struct VoiceParams {
     pub sibilance_tame: f32,
     /// Dry/wet mix. Range: `0..=1` (`1.0` = fully processed).
     pub mix: f32,
+    /// Phase 3 (Plan 03-01, D-45) enable toggle for the breathiness shaping stage.
+    /// When `false`, warm-off semantics per D-42 — the stage still runs each block, only the
+    /// output is bypassed. Default `true` per D-45.
+    /// Note: there is NO `mix_enabled` field — per D-47, dry/wet has no toggle (mix=0.0 IS the
+    /// off state). The Phase 3 contract is THREE bools, not four (RESEARCH §Open Question 3).
+    pub breathiness_enabled: bool,
+    /// Phase 3 (Plan 03-01, D-44) enable toggle for the brightness high-shelf shaping stage.
+    /// When `false`, warm-off semantics per D-42 — the stage still runs each block, only the
+    /// output is bypassed. Default `true` per D-44.
+    pub brightness_enabled: bool,
+    /// Phase 3 (Plan 03-01, D-46) enable toggle for the de-esser / sibilance taming shaping stage.
+    /// When `false`, warm-off semantics per D-42 — the stage still runs each block, only the
+    /// output is bypassed. Default `true` per D-46.
+    pub sibilance_tame_enabled: bool,
     /// DSP quality-vs-latency preset.
     pub quality_preset: QualityPreset,
     /// Optional UI color tag for the voice library.
@@ -53,18 +67,21 @@ pub struct VoiceParams {
 impl Default for VoiceParams {
     /// The seeded "Default" voice (D-07): the spec's M→F starting point.
     ///
-    /// pitch +8.7 st (≈1.65×), formant +2.9 st (≈1.18×), compensate true, all shaping at 0,
-    /// full wet mix, Balanced preset. These are ear-tuned in Phases 2–3; no DSP consumes them
-    /// in Phase 0.
+    /// pitch +8.7 st (≈1.65×), formant +2.9 st (≈1.18×), compensate true, Balanced preset.
+    /// Phase 3 ship-time shaping defaults (D-44..D-47): brightness +3 dB, breathiness 0.20,
+    /// sibilance-tame 0.30, dry/wet 1.0, all three `*_enabled` toggles ON. Session-only per D-39.
     fn default() -> Self {
         Self {
             pitch_semitones: 8.7,   // ≈ 1.651×
             formant_semitones: 2.9, // ≈ 1.184×
             compensate_pitch: true,
-            breathiness: 0.0,
-            brightness_db: 0.0,
-            sibilance_tame: 0.0,
-            mix: 1.0,
+            breathiness: 0.20,   // D-45 ship-time default (was 0.0 in Phase 0/1/2)
+            brightness_db: 3.0,  // D-44 ship-time default (was 0.0 in Phase 0/1/2)
+            sibilance_tame: 0.30, // D-46 ship-time default (was 0.0 in Phase 0/1/2)
+            mix: 1.0,            // D-47 (unchanged — fully wet on first launch)
+            breathiness_enabled: true,    // D-45 toggle ON by default
+            brightness_enabled: true,     // D-44 toggle ON by default
+            sibilance_tame_enabled: true, // D-46 toggle ON by default
             quality_preset: QualityPreset::Balanced,
             color_tag: None,
         }

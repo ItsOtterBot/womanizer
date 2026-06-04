@@ -5070,6 +5070,7 @@ dependencies = [
  "crossbeam-channel",
  "rtrb",
  "serde",
+ "serde_json",
  "serial_test",
  "thiserror 2.0.18",
  "triple_buffer",

@@ -29,3 +29,6 @@ anyhow = { workspace = true }
 # because it has no other consumer in the workspace.
 [dev-dependencies]
 serial_test = "3"
+# Phase 3 Plan 03-01: voice_params_shaping.rs tests the VoiceParams serde JSON round-trip
+# for the three new bool enable fields. Pinned in [workspace.dependencies]; dev-only here.
+serde_json = { workspace = true }
