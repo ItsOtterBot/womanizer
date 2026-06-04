@@ -155,9 +155,9 @@ pub fn spawn_dsp_worker(
             let mut scratch = [0f32; BLOCK];
             let mut processed = [0f32; BLOCK];
             let mut stretch_out = [0f32; BLOCK]; // signalsmith output
-            let mut deess_out = [0f32; BLOCK];   // post-de-esser
-            let mut bright_out = [0f32; BLOCK];  // post-brightness-shelf
-            let mut breath_out = [0f32; BLOCK];  // post-breath-injection
+            let mut deess_out = [0f32; BLOCK]; // post-de-esser
+            let mut bright_out = [0f32; BLOCK]; // post-brightness-shelf
+            let mut breath_out = [0f32; BLOCK]; // post-breath-injection
 
             // Phase 2 Plan 02-04: construct the signalsmith Stretch instance OFF the audio
             // callback path (worker spawn time). The Balanced preset is the boot default;
@@ -222,8 +222,7 @@ pub fn spawn_dsp_worker(
             // D-40 chain order LOCKED: stretch → deess → brightness → breath → dry_wet_mix.
             let mut deesser = crate::dsp::DeEsser::new(crate::dsp::ENGINE_SR as f32);
             let mut brightness = crate::dsp::BrightnessShelf::new(crate::dsp::ENGINE_SR as f32);
-            let mut breath =
-                crate::dsp::Breathiness::new(crate::dsp::ENGINE_SR as f32, 0x12345678);
+            let mut breath = crate::dsp::Breathiness::new(crate::dsp::ENGINE_SR as f32, 0x12345678);
             loop {
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;

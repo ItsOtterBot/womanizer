@@ -1,11 +1,10 @@
 # Womanizer CI — supply-chain + build-integrity gate (INFRA-01 / INFRA-02).
 #
 # Two jobs make up the merge gate that branch protection on `main` must REQUIRE (Pitfall 4):
-#   1. build-test  — a two-OS NATIVE matrix proving the single binary builds + tests on BOTH
-#                    x86_64-pc-windows-msvc (windows-latest) and aarch64-apple-darwin (macos-14,
-#                    Apple Silicon). Native, NOT cross-compiled (Pitfall 6). Runs fmt --check,
-#                    clippy -D warnings, release build, and the full test suite (incl. the
-#                    assert_no_alloc no-alloc guard + smoke + db tests) — the full gate (D-10).
+#   1. build-test  — native build on x86_64-pc-windows-msvc (windows-latest). Native, NOT
+#                    cross-compiled (Pitfall 6). Runs fmt --check, clippy -D warnings, release
+#                    build, and the full test suite (incl. the assert_no_alloc no-alloc guard
+#                    + smoke + db tests) — the full gate (D-10).
 #   2. license-gate — runs `cargo deny check licenses` against the resolved workspace dep graph
 #                    via the audited EmbarkStudios/cargo-deny-action@v2, enforcing the no-GPL
 #                    boundary (D-02 / D-03 / INFRA-02). Reads the repo-root deny.toml.
@@ -32,40 +31,30 @@ permissions:
 
 jobs:
   build-test:
-    name: build-test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-14
-            target: aarch64-apple-darwin
+    name: build-test (windows-latest)
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.92 (${{ matrix.target }})
+      - name: Install Rust 1.92 (x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@1.92
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
           components: clippy, rustfmt
 
-      - name: Install LLVM (Windows — libclang required by bindgen for signalsmith-stretch)
+      - name: Install LLVM (libclang required by bindgen for signalsmith-stretch)
         # signalsmith-stretch 0.1.3 pulls bindgen ^0.70 as a build-dep; bindgen needs
         # libclang.dll at build time. Visual Studio Build Tools does NOT ship libclang —
         # only the LLVM toolchain does. Without this step the first clean build on a
         # Windows runner fails with "error: Unable to find libclang" (RESEARCH §Pitfall 3
-        # / T-2-build-env). macOS runners use Apple's clang via Xcode CLT and need no
-        # install; the `if:` guard keeps the install out of the macos-14 job.
-        if: runner.os == 'Windows'
+        # / T-2-build-env).
         run: choco install llvm --yes --no-progress
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: x86_64-pc-windows-msvc
 
       - name: rustfmt (check)
         run: cargo fmt --all --check
@@ -74,7 +63,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: build (release, native target)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: test (full suite incl. no-alloc guard)
         # --features enables the AUDIO-09 reconnect integration test (gated behind

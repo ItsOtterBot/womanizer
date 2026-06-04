@@ -1319,8 +1319,7 @@ impl Breathiness {
             //      breath_amount × voicing_gate × rms_envelope × headroom × bandpass_noise
             //    Headroom (0.5) prevents the noise peak from exceeding signal RMS even at
             //    breath_amount=1.0 (RESEARCH §Pattern 5 table — preserves natural feel).
-            let noise_add =
-                breath_amount * voicing_gate * self.envelope * 0.5 * breath_noise;
+            let noise_add = breath_amount * voicing_gate * self.envelope * 0.5 * breath_noise;
 
             // 5. D-42 warm-off: assignment is the ONLY branch that respects `enabled`.
             //    All stateful sub-components (PRNG, biquad, envelope) already advanced.
@@ -1376,10 +1375,7 @@ pub fn dry_wet_mix(dry: &[f32], wet: &[f32], mix: f32, output: &mut [f32]) {
     let output_chunks_len = (output.len() / 8) * 8;
     let (out_chunks, out_rem) = output.split_at_mut(output_chunks_len);
 
-    for ((d, w), o) in chunks_d
-        .zip(chunks_w)
-        .zip(out_chunks.chunks_exact_mut(8))
-    {
+    for ((d, w), o) in chunks_d.zip(chunks_w).zip(out_chunks.chunks_exact_mut(8)) {
         // `chunks_exact(8)` guarantees 8-element slices; `try_into` over an 8-element
         // slice is infallible.
         let d_arr: [f32; 8] = d

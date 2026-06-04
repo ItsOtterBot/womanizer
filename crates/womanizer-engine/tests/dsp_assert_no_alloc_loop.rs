@@ -333,8 +333,7 @@ fn assert_no_alloc_loop() {
             samples_since_f0 = samples_since_f0.saturating_add(BLOCK);
             if samples_since_f0 >= F0_INTERVAL_SAMPLES {
                 samples_since_f0 = 0;
-                let pitch_result =
-                    assert_no_alloc::permit_alloc(|| yin.get_pitch(&f0_window));
+                let pitch_result = assert_no_alloc::permit_alloc(|| yin.get_pitch(&f0_window));
                 match pitch_result {
                     Some(f0) => {
                         tele.input_f0_hz.store(f0, Ordering::Relaxed);

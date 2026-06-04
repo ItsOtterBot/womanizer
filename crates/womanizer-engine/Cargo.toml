@@ -54,7 +54,7 @@ regex = { workspace = true }
 #
 # regex is moved into dev-dependencies (in addition to the Windows-cfg-gated production dep
 # above) so the `devices::regex_tests` regex-assertion module in devices/mod.rs builds and
-# runs on Linux / macOS dev hosts and CI — VALIDATION.md row DEVICE-04 (revision B2) names
+# runs on non-Windows dev hosts and CI — VALIDATION.md row DEVICE-04 (revision B2) names
 # `devices::regex_tests::regex_matches` as the named test and it must be runnable everywhere.
 # Dev-deps are only compiled for `cargo test`, so the shipped release binary is unaffected.
 [dev-dependencies]

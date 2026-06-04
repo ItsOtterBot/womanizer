@@ -75,12 +75,12 @@ impl Default for VoiceParams {
             pitch_semitones: 8.7,   // ≈ 1.651×
             formant_semitones: 2.9, // ≈ 1.184×
             compensate_pitch: true,
-            breathiness: 0.20,   // D-45 ship-time default (was 0.0 in Phase 0/1/2)
-            brightness_db: 3.0,  // D-44 ship-time default (was 0.0 in Phase 0/1/2)
+            breathiness: 0.20,    // D-45 ship-time default (was 0.0 in Phase 0/1/2)
+            brightness_db: 3.0,   // D-44 ship-time default (was 0.0 in Phase 0/1/2)
             sibilance_tame: 0.30, // D-46 ship-time default (was 0.0 in Phase 0/1/2)
-            mix: 1.0,            // D-47 (unchanged — fully wet on first launch)
-            breathiness_enabled: true,    // D-45 toggle ON by default
-            brightness_enabled: true,     // D-44 toggle ON by default
+            mix: 1.0,             // D-47 (unchanged — fully wet on first launch)
+            breathiness_enabled: true, // D-45 toggle ON by default
+            brightness_enabled: true, // D-44 toggle ON by default
             sibilance_tame_enabled: true, // D-46 toggle ON by default
             quality_preset: QualityPreset::Balanced,
             color_tag: None,

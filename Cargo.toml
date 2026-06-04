@@ -21,7 +21,7 @@
 # allocation via #[should_panic] (the default behavior aborts, which is not catchable).
 #
 # rusqlite carries the mandatory `bundled` feature (Pitfall 5): compiles SQLite from source so
-# there is zero system dependency on Windows or macOS, preserving the single-binary promise.
+# there is zero system dependency, preserving the single-binary promise.
 
 [workspace]
 resolver = "2"
@@ -60,12 +60,12 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # --- Declared so the dep graph + license gate are real and INFRA-01 proves the ACTUAL
-#     binary builds on both OSes (Open Question 2). NOT wired in Phase 0. ---
+#     binary builds (Open Question 2). NOT wired in Phase 0. ---
 # Phase 1 (Plan 01-01): the cpal `audio_thread_priority` feature is OPTIONAL in cpal 0.17.3 and
 # MUST be opted in explicitly here (D-20). Without this feature the audio callback thread is not
-# promoted to RT priority (MMCSS "Pro Audio" on Win, time-constraint on Mac) and the < 50 ms
-# latency budget is unreachable. The "automatic in 0.17.x" line in the workspace notes refers
-# to the *availability* of the integration, not the default-feature state.
+# promoted to RT priority (MMCSS "Pro Audio" on Windows) and the < 50 ms latency budget is
+# unreachable. The "automatic in 0.17.x" line in the workspace notes refers to the *availability*
+# of the integration, not the default-feature state.
 cpal = { version = "0.17", features = ["audio_thread_priority"] }
 eframe = "0.34"
 egui = "0.34"

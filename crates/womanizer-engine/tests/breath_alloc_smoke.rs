@@ -80,7 +80,8 @@ fn breath_alloc_free_smoke() {
 
     let after = assert_no_alloc::violation_count();
     assert_eq!(
-        after, before,
+        after,
+        before,
         "Breathiness::process tripped the assert_no_alloc violation counter across 3 \
          blocks (voiced+enabled, unvoiced, warm-off) — a per-sample / per-block \
          allocation was introduced. Counter delta = {}",
