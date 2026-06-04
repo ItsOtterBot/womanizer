@@ -144,8 +144,20 @@ pub fn spawn_dsp_worker(
             // it). Phase 2: `scratch` holds the raw capture frames; `processed` receives
             // signalsmith's pitch+formant-shifted output. The bypass branch (D-27/D-28)
             // selects which of the two goes to vo_tx without ever skipping the process() call.
+            //
+            // Phase 3 Plan 03-04: four NEW inter-stage scratch buffers landed adjacent to
+            // `scratch` + `processed` per RESEARCH §Stack Scratch Buffer Layout + Pattern H.
+            // Total stack now = 6 × (256 × 4 B) = 6 KB (Phase 2 had 2 KB; 0.6% of the 1 MB
+            // Windows worker stack). Inline locals — NOT a `WorkerScratch` aggregate —
+            // match Phase 1/2 idiom (Pattern H "easy-to-break convention #1"). The chain
+            // (D-40 LOCKED) flows: scratch → stretch_out → deess_out → bright_out →
+            // breath_out → processed (via dry_wet_mix).
             let mut scratch = [0f32; BLOCK];
             let mut processed = [0f32; BLOCK];
+            let mut stretch_out = [0f32; BLOCK]; // signalsmith output
+            let mut deess_out = [0f32; BLOCK];   // post-de-esser
+            let mut bright_out = [0f32; BLOCK];  // post-brightness-shelf
+            let mut breath_out = [0f32; BLOCK];  // post-breath-injection
 
             // Phase 2 Plan 02-04: construct the signalsmith Stretch instance OFF the audio
             // callback path (worker spawn time). The Balanced preset is the boot default;
@@ -200,6 +212,18 @@ pub fn spawn_dsp_worker(
             let mut f0_window: [f32; 512] = [0.0; 512];
             let mut samples_since_f0: usize = 0;
             const F0_INTERVAL_SAMPLES: usize = 1600;
+
+            // Phase 3 Plan 03-04: four shaping stages constructed OFF the audio path.
+            // - DeEsser: split-band compressor at 6500 Hz / Q=1.0 (RESEARCH §Pattern 3)
+            // - BrightnessShelf: RBJ high-shelf at 4000 Hz / Q=0.707 (RESEARCH §Pattern 4)
+            // - Breathiness: XorShift32 PRNG + 1200 Hz/Q=0.4 bandpass + envelope follower
+            //   (RESEARCH §Pattern 5). Seed 0x12345678 per D-50.
+            // - dry_wet_mix: free function, no struct (D-47 — mix=0 IS off).
+            // D-40 chain order LOCKED: stretch → deess → brightness → breath → dry_wet_mix.
+            let mut deesser = crate::dsp::DeEsser::new(crate::dsp::ENGINE_SR as f32);
+            let mut brightness = crate::dsp::BrightnessShelf::new(crate::dsp::ENGINE_SR as f32);
+            let mut breath =
+                crate::dsp::Breathiness::new(crate::dsp::ENGINE_SR as f32, 0x12345678);
             loop {
                 if stop_flag_inner.load(Ordering::Relaxed) {
                     break;
@@ -261,6 +285,20 @@ pub fn spawn_dsp_worker(
                     let target = snap_out.read();
                     let target_pitch_ratio = target.pitch_semitones_to_ratio();
                     let target_formant_ratio = target.formant_semitones_to_ratio();
+                    // Phase 3 Plan 03-04: widen the per-block snapshot cache for the four
+                    // new shaping stages. Cache the four f32 targets + three enable bools
+                    // into stack locals OUTSIDE the `assert_no_alloc(|| { ... })` wrap so
+                    // the `&VoiceParams` borrow's lifetime ends before the closure body
+                    // (Pattern J — VoiceParams is `!Copy` due to `Option<String> color_tag`).
+                    // Seven cached values total (4 floats + 3 bools); replaces the Plan
+                    // 03-01 placeholder reads from `default_voice`.
+                    let target_breath = target.breathiness;
+                    let target_bright_db = target.brightness_db;
+                    let target_sib = target.sibilance_tame;
+                    let target_mix = target.mix;
+                    let enable_breath = target.breathiness_enabled;
+                    let enable_bright = target.brightness_enabled;
+                    let enable_sib = target.sibilance_tame_enabled;
 
                     // D-28 bypass-warm contract: stretch.process() is called UNCONDITIONALLY
                     // every block so the signalsmith phase-vocoder state stays continuous;
@@ -285,24 +323,17 @@ pub fn spawn_dsp_worker(
                     //     write with no allocation) — D-31 assert_no_alloc identical-
                     //     across-branches invariant preserved.
                     assert_no_alloc(|| {
-                        // Plan 03-01: SmoothedVoiceParams.step widened from 2 → 6 targets.
-                        // The four new shaping targets (breath / brightness_db / sibilance
-                        // / mix) are placeholders sourced from the pre-existing
-                        // `default_voice` binding (defined off-RT at line ~156, outlives
-                        // the worker loop). Plan 03-04 will replace these with cached
-                        // values read from `snap_out.read()` alongside target_pitch_ratio
-                        // / target_formant_ratio — that wiring is NOT Plan 03-01's job.
-                        // Until then, the smoother's four new fields stay at their
-                        // ship-time defaults (which match the placeholder targets),
-                        // producing constant — i.e. zero-effect — output for the
-                        // downstream shaping stages once they exist.
+                        // Phase 3 Plan 03-04: smoothed.step widened to 6 args sourced from
+                        // the per-block snapshot cache (above). Each shaping stage reads
+                        // its smoothed value below; SmoothedVoiceParams owns the 30 ms tau
+                        // (D-35 unchanged).
                         smoothed.step(
                             target_pitch_ratio,
                             target_formant_ratio,
-                            default_voice.breathiness,
-                            default_voice.brightness_db,
-                            default_voice.sibilance_tame,
-                            default_voice.mix,
+                            target_breath,
+                            target_bright_db,
+                            target_sib,
+                            target_mix,
                         );
                         stretch.set_transpose(smoothed.pitch());
                         stretch.set_formant(smoothed.formant());
@@ -310,9 +341,52 @@ pub fn spawn_dsp_worker(
                         let raw_rms = tele.input_rms.load(Ordering::Relaxed);
                         let gate_open = gate.update(raw_rms);
 
-                        stretch.process(&scratch, &mut processed);
+                        // D-40 chain order LOCKED.
+                        // Stage 1: signalsmith (D-28 warm-bypass — ALWAYS runs).
+                        stretch.process(&scratch, &mut stretch_out);
+
+                        // Stages 2-4: D-42 warm-off. ALL stages process() UNCONDITIONALLY
+                        // each block. The `enabled` arg routes the output around
+                        // (passthrough) or through (filtered) the stage; the internal
+                        // state always updates so re-enabling produces zero glitch.
+                        // RESEARCH §Common Pitfall 5 calls out the failure mode of
+                        // skipping .process() on warm-off.
+                        deesser.process(
+                            &stretch_out,
+                            &mut deess_out,
+                            smoothed.sibilance(),
+                            enable_sib,
+                            crate::dsp::ENGINE_SR as f32,
+                        );
+                        brightness.process(
+                            &deess_out,
+                            &mut bright_out,
+                            smoothed.brightness_db(),
+                            enable_bright,
+                            crate::dsp::ENGINE_SR as f32,
+                        );
+                        breath.process(
+                            &bright_out,
+                            &mut breath_out,
+                            smoothed.breathiness(),
+                            enable_breath,
+                            tele.output_f0_hz.load(Ordering::Relaxed),
+                        );
+
+                        // D-29 + D-51 gate-closed override: hard zero AFTER stages run so
+                        // state stays coherent for the transition to gate-open. D-42
+                        // warm-off discipline EXTENDED across the gate-closed branch.
+                        // D-43 dry/wet: dry = raw mic (scratch); wet = breath_out
+                        // (post-shaping).
                         if !gate_open {
                             processed.fill(0.0);
+                        } else {
+                            crate::dsp::dry_wet_mix(
+                                &scratch,
+                                &breath_out,
+                                smoothed.mix(),
+                                &mut processed,
+                            );
                         }
 
                         // Phase 2 Plan 02-06: YIN F0 subsample tick (D-32 ~30 Hz). Runs
@@ -327,6 +401,7 @@ pub fn spawn_dsp_worker(
                         // unvoiced: store f32::NAN to BOTH fields so the UI's .is_nan()
                         // check renders "—" (D-32). Relaxed ordering (Pattern C —
                         // overwrite-latest semantics, single writer).
+                        //
                         samples_since_f0 = samples_since_f0.saturating_add(BLOCK);
                         if samples_since_f0 >= F0_INTERVAL_SAMPLES {
                             samples_since_f0 = 0;
@@ -343,6 +418,10 @@ pub fn spawn_dsp_worker(
                             }
                         }
 
+                        // D-41 Bypass UNCHANGED: raw mic (scratch) vs post-chain
+                        // (processed). All shaping stages still ran above — toggling
+                        // Bypass off is instant + click-free (D-28 warm-bypass extended
+                        // to all four shaping stages per D-41).
                         let to_push: &[f32] = if hot.bypass.load(Ordering::Relaxed) {
                             &scratch
                         } else {
