@@ -906,6 +906,179 @@ impl BrightnessShelf {
     }
 }
 
+/// Soft-knee gain-reduction formula per RESEARCH §Pattern 3 / the canonical
+/// compressor literature (`christianfloisand.wordpress.com/.../dynamics-processing-
+/// compressorlimiter-part-1/`). All inputs/outputs are in dB; the returned value is the
+/// gain reduction in dB (≤ 0 — zero means no reduction, negative means attenuation).
+///
+/// Three branches:
+/// 1. Below the knee (`level_db < threshold - half_knee`): no reduction (return 0.0).
+/// 2. Above the knee (`level_db > threshold + half_knee`): full-ratio compression →
+///    `(threshold − level) * (1 − 1/ratio)`. Negative because level > threshold.
+/// 3. Inside the knee: quadratic interpolation that smoothly joins the two outer
+///    branches, eliminating the audible "click" of hard-knee compression.
+///
+/// Used by [`DeEsser::process`] per-sample on the envelope follower's instantaneous dB.
+#[inline]
+fn soft_knee_gr_db(level_db: f32, threshold_db: f32, ratio: f32, knee_width_db: f32) -> f32 {
+    let half_knee = knee_width_db * 0.5;
+    if level_db < threshold_db - half_knee {
+        0.0
+    } else if level_db > threshold_db + half_knee {
+        (threshold_db - level_db) * (1.0 - 1.0 / ratio)
+    } else {
+        let x = level_db - threshold_db + half_knee;
+        let a = (1.0 - 1.0 / ratio) / (2.0 * knee_width_db);
+        -a * x * x
+    }
+}
+
+/// SHAPE-03 — Split-band compressor de-esser per RESEARCH §Pattern 3 + §Example D.
+/// Two [`BiquadDF1`] bandpasses (`detector_band` + `extract_band`) at 6500 Hz / Q=1.0
+/// with INDEPENDENT state drive a one-pole envelope follower (1 ms attack / 50 ms
+/// release per-sample alpha) feeding a soft-knee gain-reduction stage (threshold −24
+/// dBFS, knee width 6 dB). The split-band output formula
+/// `output = input - (1 - linear_gain) * extract_output` (RESEARCH §Pattern 3 line 702)
+/// subtracts excess sibilance from the input rather than reconstructing a low band +
+/// gain-reduced high band — preserves low-mid clarity (RESEARCH §Pitfall 4 mitigation).
+///
+/// ## UI semantics (D-46)
+/// The `sibilance_amount` slider is mapped to an effective ratio per RESEARCH §Pattern 3
+/// table: `effective_ratio = 1.0 + sibilance_amount * 5.0` so slider 0 → 1:1 (identity),
+/// slider 0.30 (D-46 ship-time default) → ~2.5:1 (light de-essing), slider 1.0 → 6:1
+/// (heavy). At slider 0 the soft-knee formula collapses to gr_db = 0 (no reduction) → the
+/// output equals the input bit-exact within the float-rounding budget (verified by
+/// `deess_amount_zero_passthrough`).
+///
+/// ## Lifecycle
+/// - Constructed OFF the audio thread (DSP worker spawn — Plan 03-04).
+/// - Owned exclusively by the DSP worker thread; never wrapped in Mutex.
+/// - `process()` is called every audio block. Inside `assert_no_alloc(|| { ... })`.
+///
+/// ## D-42 warm contract
+/// `process()` runs UNCONDITIONALLY every block regardless of `enabled`. All four
+/// stateful components — `detector_band.step()`, `extract_band.step()`, the one-pole
+/// `envelope` follower, and the per-sample soft-knee gain-reduction computation — update
+/// each sample. Only the assignment to `*yi` respects the bool (`*yi = if enabled
+/// { processed } else { *xi }`). Toggling enabled back on therefore produces zero
+/// startup transient (RESEARCH §Pitfall 5).
+pub struct DeEsser {
+    /// Detector bandpass at 6500 Hz / Q=1.0 (~1 octave bandwidth). Used to extract the
+    /// sibilance-band magnitude that drives the envelope follower.
+    detector_band: BiquadDF1,
+    /// Extract bandpass at 6500 Hz / Q=1.0 (same coefficients, INDEPENDENT state).
+    /// The output formula subtracts `(1 - linear_gain) * extract_output` from the input.
+    extract_band: BiquadDF1,
+    /// One-pole envelope follower state — instantaneous absolute-value of the detector
+    /// bandpass output, smoothed via attack/release alphas per RESEARCH §Pattern 2.
+    envelope: f32,
+    /// Per-sample attack coefficient (1 ms tau at the engine sample rate). Precomputed
+    /// once at construction; ≈ 0.0206 at 48 kHz.
+    alpha_attack: f32,
+    /// Per-sample release coefficient (50 ms tau at the engine sample rate). Precomputed
+    /// once at construction; ≈ 0.000417 at 48 kHz.
+    alpha_release: f32,
+    /// Threshold in dBFS for the soft-knee gain reduction. −24 dBFS per RESEARCH
+    /// §Pattern 3 table.
+    threshold_db: f32,
+    /// Soft-knee width in dB. 6 dB per RESEARCH §Pattern 3 table — smooths the threshold
+    /// crossing so a level hovering near −24 dBFS does not produce audible "click"
+    /// compression edges.
+    knee_width_db: f32,
+}
+
+impl DeEsser {
+    /// Construct a DeEsser with both bandpasses pre-configured at 6500 Hz / Q=1.0,
+    /// envelope-follower alphas computed from the supplied sample rate, and the
+    /// RESEARCH §Pattern 3 threshold / knee parameters.
+    pub fn new(fs: f32) -> Self {
+        let mut detector_band = BiquadDF1::new();
+        detector_band.set_bandpass(fs, 6500.0, 1.0);
+        let mut extract_band = BiquadDF1::new();
+        extract_band.set_bandpass(fs, 6500.0, 1.0);
+        Self {
+            detector_band,
+            extract_band,
+            envelope: 0.0,
+            // Per-sample one-pole follower coefficients (RESEARCH §Pattern 2):
+            //   alpha = 1.0 - exp(-1.0 / (tau_seconds * fs))
+            alpha_attack: 1.0 - (-1.0 / (0.001 * fs)).exp(),
+            alpha_release: 1.0 - (-1.0 / (0.050 * fs)).exp(),
+            threshold_db: -24.0,
+            knee_width_db: 6.0,
+        }
+    }
+
+    /// Per-block hot path. Per-sample loop runs the detector → envelope follower →
+    /// soft-knee gain reduction → split-band subtraction sequence per RESEARCH §Example D
+    /// and §Pattern 3 line 702.
+    ///
+    /// `sibilance_amount` is the smoothed slider value [0, 1] (typically published by
+    /// [`SmoothedVoiceParams::sibilance`]). The effective compressor ratio is
+    /// `1.0 + sibilance_amount * 5.0` (D-46) — at 0 the gain reduction is identically
+    /// zero, so output = input within float-rounding.
+    ///
+    /// D-42 warm-off: detector_band, extract_band, envelope follower, and soft-knee
+    /// computation all update every sample regardless of `enabled`. Only the assignment
+    /// to `*yi` respects the bool.
+    ///
+    /// `_fs` is the engine sample rate. Currently unused inside the per-sample loop —
+    /// the bandpass coefficients are static at 6500 Hz so they need no re-set; the
+    /// envelope-follower alphas were precomputed at construction. Accepted as an argument
+    /// to mirror Pattern B's process signature shape and to be future-proof against a
+    /// sample-rate change.
+    #[inline]
+    pub fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        sibilance_amount: f32,
+        enabled: bool,
+        _fs: f32,
+    ) {
+        debug_assert_eq!(input.len(), output.len());
+        // D-46 slider → ratio mapping: slider 0 → 1:1 (identity), 1.0 → 6:1.
+        let effective_ratio = 1.0 + sibilance_amount * 5.0;
+
+        for (xi, yi) in input.iter().zip(output.iter_mut()) {
+            // 1. Detector bandpass + one-pole envelope follower (RESEARCH §Pattern 2).
+            //    `step()` runs UNCONDITIONALLY each sample — D-42 warm-off contract.
+            let det = self.detector_band.step(*xi).abs();
+            let alpha = if det > self.envelope {
+                self.alpha_attack
+            } else {
+                self.alpha_release
+            };
+            self.envelope += alpha * (det - self.envelope);
+
+            // 2. Soft-knee gain reduction in dB. The 1e-10 floor on the envelope avoids
+            //    log10(0) → −∞ when envelope is zero (e.g. during silence).
+            let env_db = 20.0 * self.envelope.max(1e-10).log10();
+            let gr_db = soft_knee_gr_db(
+                env_db,
+                self.threshold_db,
+                effective_ratio,
+                self.knee_width_db,
+            );
+            let gain_linear = 10.0_f32.powf(gr_db / 20.0);
+
+            // 3. Split-band output formula (RESEARCH §Pattern 3 line 702):
+            //      output = input - (1 - linear_gain) * extract_output
+            //    Subtracts excess sibilance from the input rather than reconstructing
+            //    low_band + gain_reduced_high. The extract_band's state is INDEPENDENT
+            //    of the detector_band's state — both are bandpasses at the same center
+            //    frequency but they evolve their own x1/x2/y1/y2 delays. `step()` runs
+            //    UNCONDITIONALLY each sample — D-42 warm-off contract.
+            let high_band = self.extract_band.step(*xi);
+            let processed = *xi - (1.0 - gain_linear) * high_band;
+
+            // 4. D-42 warm-off: assignment is the ONLY branch that respects `enabled`.
+            //    detector_band / extract_band / envelope all already updated above.
+            *yi = if enabled { processed } else { *xi };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +1870,129 @@ mod tests {
                 "BrightnessShelf D-42 warm-off violation at sample {i}: \
                  always-on output={}, off-then-on output={}, diff={diff} \
                  (expected < 1e-3 if biquad state stayed coherent during warm-off)",
+                out_on[i],
+                out_off_then_on[i]
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Plan 03-02 — DeEsser (SHAPE-03) contract tests.
+    // ---------------------------------------------------------------------------------
+
+    /// SHAPE-03 Behavior Test 1: at `sibilance_amount=0.0`, the effective ratio is
+    /// 1.0 + 0.0 * 5.0 = 1:1, so the soft-knee formula returns `gr_db = 0` (no
+    /// reduction; `gain_linear = 1.0`), and the split-band output formula collapses to
+    /// `output = input - (1.0 - 1.0) * extract_band.step(x) = input` — bit-exact
+    /// passthrough regardless of how loud the sibilance band is.
+    ///
+    /// Drives the detector deliberately above the −24 dBFS threshold (amplitude 0.5
+    /// sine ≈ −6 dBFS; sustained 8 kHz tone sits inside the detector bandpass at
+    /// 6500 Hz / Q=1.0) to prove the bypass is gain-driven, not detector-driven.
+    #[test]
+    fn deess_amount_zero_passthrough() {
+        let mut de = DeEsser::new(ENGINE_SR as f32);
+        let input = sine_window(8000.0, 0.5, 2048);
+        let mut output = vec![0f32; input.len()];
+        de.process(&input, &mut output, 0.0, true, ENGINE_SR as f32);
+        for (i, (x, y)) in input.iter().zip(output.iter()).enumerate() {
+            let diff = (x - y).abs();
+            assert!(
+                diff < 1e-6,
+                "DeEsser at amount=0 must produce bit-exact passthrough; \
+                 sample {i}: input={x}, output={y}, diff={diff}"
+            );
+        }
+    }
+
+    /// SHAPE-03 Behavior Test 2: at `sibilance_amount=1.0` (6:1 effective ratio), a
+    /// sustained 8 kHz sine at amplitude 0.5 (≈ −6 dBFS) drives the detector well above
+    /// the −24 dBFS threshold inside the bandpass's passband. The envelope follower
+    /// settles to a steady-state value; the soft-knee formula returns a steady negative
+    /// gr_db; the split-band subtraction therefore attenuates the steady-state output.
+    ///
+    /// Skip first 512 samples for envelope settling (1 ms attack ≈ 48 samples — 512 is
+    /// 10+ time-constants). Steady-state RMS reduction must be > 3 dB vs input.
+    #[test]
+    fn deess_reduces_hi_freq_when_loud() {
+        let mut de = DeEsser::new(ENGINE_SR as f32);
+        let input = sine_window(8000.0, 0.5, 4096);
+        let mut output = vec![0f32; input.len()];
+        de.process(&input, &mut output, 1.0, true, ENGINE_SR as f32);
+        let in_rms = slice_rms(&input[512..]);
+        let out_rms = slice_rms(&output[512..]);
+        let ratio_db = 20.0 * (out_rms / in_rms).log10();
+        assert!(
+            ratio_db < -3.0,
+            "DeEsser at amount=1 on 8 kHz sustained sine: expected > 3 dB attenuation \
+             at steady state, observed ratio_db={ratio_db} (in_rms={in_rms}, out_rms={out_rms})"
+        );
+    }
+
+    /// SHAPE-03 Behavior Test 3: at `sibilance_amount=1.0`, a 200 Hz sine — well below
+    /// the 6500 Hz detector bandpass center, attenuated by the Q=1.0 bandpass — never
+    /// drives the envelope follower above the −24 dBFS threshold; the soft-knee formula
+    /// returns gr_db = 0; no reduction is applied; output ≈ input.
+    ///
+    /// Skip first 256 samples for state warm-up. Steady-state RMS ratio must be within
+    /// 0.5 dB of unity.
+    #[test]
+    fn deess_passes_low_freq() {
+        let mut de = DeEsser::new(ENGINE_SR as f32);
+        let input = sine_window(200.0, 0.5, 2048);
+        let mut output = vec![0f32; input.len()];
+        de.process(&input, &mut output, 1.0, true, ENGINE_SR as f32);
+        let in_rms = slice_rms(&input[256..]);
+        let out_rms = slice_rms(&output[256..]);
+        let ratio_db = 20.0 * (out_rms / in_rms).log10();
+        assert!(
+            ratio_db.abs() < 0.5,
+            "DeEsser at amount=1 on 200 Hz sine (below detection band) should be \
+             unity-passthrough — detector bandpass attenuates 200 Hz to silence, no GR \
+             triggered. Observed ratio_db={ratio_db}, expected ~0.0 dB"
+        );
+    }
+
+    /// SHAPE-03 Behavior Test 4: D-42 warm-off STRUCTURAL gate — disabled instance's
+    /// detector_band, extract_band, and envelope follower all evolve identically to the
+    /// always-enabled instance's during the warm-up phase. After both are switched to
+    /// enabled=true, the outputs match sample-by-sample because all stateful components
+    /// were in lockstep during warm-off.
+    ///
+    /// Looser tolerance (< 0.01) than BrightnessShelf because the de-esser has an extra
+    /// stateful component (the envelope follower) plus a non-linear soft-knee gain stage.
+    #[test]
+    fn deess_warm_off_keeps_state_updating() {
+        let fs = ENGINE_SR as f32;
+        let mut de_on = DeEsser::new(fs);
+        let mut de_off = DeEsser::new(fs);
+        // Phase 1: drive 3000 samples through both. One enabled, one disabled. With
+        // D-42 warm-off, both DeEssers' internal state (bandpass delays + envelope)
+        // evolves identically because every per-sample compute happens before the
+        // `enabled` branch.
+        let warmup = sine_window(8000.0, 0.5, 3000);
+        let mut tmp_on = vec![0f32; warmup.len()];
+        let mut tmp_off = vec![0f32; warmup.len()];
+        de_on.process(&warmup, &mut tmp_on, 1.0, true, fs);
+        de_off.process(&warmup, &mut tmp_off, 1.0, false, fs);
+
+        // Phase 2: switch off → on; drive both with new 2048 samples; LAST 1024 must
+        // match within 0.01 amplitude.
+        let drive = sine_window(8000.0, 0.5, 2048);
+        let mut out_on = vec![0f32; drive.len()];
+        let mut out_off_then_on = vec![0f32; drive.len()];
+        de_on.process(&drive, &mut out_on, 1.0, true, fs);
+        de_off.process(&drive, &mut out_off_then_on, 1.0, true, fs);
+
+        let cmp_start = drive.len() - 1024;
+        for i in cmp_start..drive.len() {
+            let diff = (out_on[i] - out_off_then_on[i]).abs();
+            assert!(
+                diff < 0.01,
+                "DeEsser D-42 warm-off violation at sample {i}: \
+                 always-on output={}, off-then-on output={}, diff={diff} \
+                 (expected < 0.01 if detector/extract/envelope all stayed coherent \
+                 during warm-off)",
                 out_on[i],
                 out_off_then_on[i]
             );
