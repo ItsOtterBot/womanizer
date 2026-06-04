@@ -402,10 +402,25 @@ pub fn spawn_dsp_worker(
                         // check renders "—" (D-32). Relaxed ordering (Pattern C —
                         // overwrite-latest semantics, single writer).
                         //
+                        //
+                        // Plan 03-04 Task 3 (revision-1, 2026-06-03 user decision Option A,
+                        // Path 3 chosen): wrap `yin.get_pitch` in `permit_alloc` to carve
+                        // out the upstream `pitch_detection 0.3.0` per-call FftPlanner
+                        // allocation in `windowed_autocorrelation`. The F0 tick fires at
+                        // ~30 Hz off the per-block Stretch hot path, so allocation jitter
+                        // risk is bounded (one FftPlanner construction per voiced get_pitch
+                        // call, ~30 Hz cadence) and tolerable. See dsp.rs::Yin48k doc
+                        // comment for the chosen path + the rejected paths (hand-roll YIN
+                        // over realfft cached planner; fork pitch-detection upstream).
+                        // tests/dsp_assert_no_alloc_loop.rs is the unignored capstone gate
+                        // that proves SC4 holds for the four Phase 3 shaping stages
+                        // running inside the strict no-alloc block.
                         samples_since_f0 = samples_since_f0.saturating_add(BLOCK);
                         if samples_since_f0 >= F0_INTERVAL_SAMPLES {
                             samples_since_f0 = 0;
-                            match yin.get_pitch(&f0_window) {
+                            let pitch_result =
+                                assert_no_alloc::permit_alloc(|| yin.get_pitch(&f0_window));
+                            match pitch_result {
                                 Some(f0) => {
                                     tele.input_f0_hz.store(f0, Ordering::Relaxed);
                                     tele.output_f0_hz

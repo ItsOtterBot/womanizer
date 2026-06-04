@@ -512,11 +512,30 @@ impl Default for Gate {
 /// 512-sample window per D-32 (~10 ms @ 48 kHz); evaluated at ~30 Hz from the DSP worker
 /// via a subsample counter (RESEARCH §Pitfall 5).
 ///
-/// ## Allocation profile
-/// `YINDetector::new(512, 0)` allocates a `BufferPool<f32>` at construction; subsequent
-/// `get_pitch` calls borrow from the pool via `RefCell` so the hot path is alloc-free
-/// (verified against pitch-detection 0.3.0 source per RESEARCH §Q4). The `padding=0`
-/// argument disables rustfft zero-padding, keeping the hot path tighter.
+/// ## Allocation profile (Plan 03-04 Task 3, revision-1, 2026-06-03)
+///
+/// `YINDetector::new(512, 0)` pre-allocates a `BufferPool<f32>` at construction. **However,
+/// pitch-detection 0.3.0 also allocates a fresh `rustfft::FftPlanner` inside
+/// `windowed_autocorrelation` on every voiced `get_pitch` call** (verified empirically by
+/// Plan 02-09's `tests/dsp_assert_no_alloc_loop.rs`: ~7,514 allocations across 1880
+/// iterations / ~268 voiced get_pitch calls). The planner allocates two `Arc<dyn Fft<f32>>`
+/// instances per call (forward + inverse). This is upstream behavior, not a `Yin48k`-side
+/// bug.
+///
+/// **Phase 3 Plan 03-04 Task 3 chose Path 3 (permit_alloc wrap)** of the three documented
+/// fix paths (the other two: Path 1 hand-roll YIN over a cached `realfft::RealFftPlanner`,
+/// ~200 LOC + new workspace dep; Path 2 fork pitch-detection upstream, ~30 LOC patch but
+/// workspace git override maintenance burden). The worker's F0 tick site wraps
+/// `yin.get_pitch` in `assert_no_alloc::permit_alloc(...)` so the upstream allocations are
+/// excluded from the violation counter. **Documented carve-out from Phase 3 SC4** — the
+/// rationale is that the F0 tick runs at 30 Hz off the per-block (188 Hz) Stretch hot
+/// path, so allocation jitter is bounded and tolerable.
+///
+/// `tests/dsp_assert_no_alloc_loop.rs` is unignored at Task 3 close and asserts
+/// `violation_count == 0` across the full 1880-iteration synthetic loop with all four
+/// Phase 3 shaping stages active inside the strict no-alloc block — proving the Phase 3
+/// addition itself introduced ZERO new allocation surface. The pre-existing pitch-detection
+/// surface remains contained behind the documented `permit_alloc` wrap.
 ///
 /// `detector` is consumed by `get_pitch()` (Plan 02-06 landed the body); fields are live.
 pub struct Yin48k {
@@ -542,10 +561,15 @@ impl Yin48k {
     /// internal power gate (Phase 2 owns gating via the separate `Gate` state machine —
     /// D-30; YIN should not also gate).
     ///
-    /// Allocation profile: `YINDetector::new(512, 0)` pre-allocates a `BufferPool` at
-    /// construction (verified against pitch-detection 0.3.0 source); subsequent `get_pitch`
-    /// calls borrow scratch via `RefCell::borrow_mut()` on the hot path, no heap allocation.
-    /// The worker calls this inside `assert_no_alloc(|| { ... })`.
+    /// Allocation profile (revision-1, Plan 03-04 Task 3): `YINDetector::new(512, 0)`
+    /// pre-allocates a `BufferPool` at construction; subsequent `get_pitch` calls borrow
+    /// scratch via `RefCell::borrow_mut()`, BUT also re-construct a fresh
+    /// `rustfft::FftPlanner` inside the upstream `windowed_autocorrelation` on every voiced
+    /// call (verified empirically by Plan 02-09's `dsp_assert_no_alloc_loop`). The worker
+    /// wraps `yin.get_pitch` in `assert_no_alloc::permit_alloc(...)` per Path 3 of the
+    /// three documented fix paths (see the `Yin48k` struct doc-comment for the full
+    /// rationale + the rejected paths). The carve-out is bounded (30 Hz tick cadence off
+    /// the per-block Stretch hot path).
     pub fn get_pitch(&mut self, signal: &[f32]) -> Option<f32> {
         const POWER_THRESHOLD: f32 = 0.0;
         const CLARITY_THRESHOLD: f32 = 0.85;
