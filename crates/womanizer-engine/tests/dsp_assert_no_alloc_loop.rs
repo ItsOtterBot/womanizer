@@ -1,11 +1,19 @@
 //! Phase 2 capstone RT-safety gate (Pitfall #1 + DSP-01 + DSP-02 + DSP-04 + DSP-06).
 //!
-//! ## DEFERRED TO PLAN 02-10 (Rule 4 architectural escalation, 2026-06-02)
+//! ## FOLDED INTO PLAN 03-04 TASK 3 (revision-1, 2026-06-03, user decision Option A on B2)
 //!
-//! **Status:** `#[ignore]`-gated pending Plan 02-10. The test BODY below is the real,
-//! intended assertion — kept live so Plan 02-10 has a known target to make pass — but it
-//! currently produces ~7,514 `assert_no_alloc` violations originating in the upstream
-//! `pitch-detection` 0.3.0 crate's YIN hot path.
+//! **Status (at end of Plan 03-04 Task 2):** still `#[ignore]`-gated. Task 3 removes the
+//! ignore once the YIN allocation fix lands. The test BODY below is the real, intended
+//! assertion — kept live so Task 3 has a known target to make pass — but it currently
+//! produces `assert_no_alloc` violations originating in the upstream `pitch-detection`
+//! 0.3.0 crate's YIN hot path.
+//!
+//! **Phase 3 Plan 03-04 Task 2 EXTENSION:** the worker body now also includes DeEsser,
+//! BrightnessShelf, Breathiness, and dry_wet_mix in D-40 LOCKED chain order. The test
+//! body is widened to mirror; assertion remains the same; Task 3 lands the YIN allocation
+//! fix that allows the test to PASS unignored with all five Phase 3 stages active inside
+//! the strict no-alloc block. Phase 3 SC4 ("assert_no_alloc continues to pass with the
+//! full pipeline") is verified empirically by Task 3 — NOT silently degraded.
 //!
 //! **Root cause (empirical, Plan 02-09 execution):** Running the full Phase 2 worker body
 //! through the 1880-iteration loop in debug surfaces allocations inside
@@ -89,7 +97,10 @@ use std::sync::Arc;
 
 use assert_no_alloc::{assert_no_alloc, reset_violation_count, violation_count};
 use womanizer_core::{HotParams, Preset, Telemetry, VoiceParams};
-use womanizer_engine::dsp::{Gate, SmoothedVoiceParams, Stretch48k, Yin48k};
+use womanizer_engine::dsp::{
+    dry_wet_mix, Breathiness, BrightnessShelf, DeEsser, Gate, SmoothedVoiceParams, Stretch48k,
+    Yin48k, ENGINE_SR,
+};
 use womanizer_engine::BLOCK;
 
 #[cfg(debug_assertions)]
@@ -134,7 +145,7 @@ fn fill_sine_block(buf: &mut [f32; BLOCK], phase: &mut f32) {
 
 #[cfg(debug_assertions)]
 #[test]
-#[ignore = "deferred to Plan 02-10 — pitch-detection 0.3.0 FftPlanner allocations in YIN windowed_autocorrelation (see module doc-comment for root cause + fix paths)"]
+#[ignore = "Plan 03-04 Task 3 owns the unignore (revision-1, 2026-06-03, user decision Option A): YIN allocation fix lands in Task 3; this gate is the capstone for Phase 3 SC4. See module doc-comment for the three fix paths."]
 #[serial_test::serial(no_alloc_violation_counter)]
 fn assert_no_alloc_loop() {
     // --- Pre-allocate every primitive the worker owns (worker spawn equivalent). ---
@@ -163,9 +174,23 @@ fn assert_no_alloc_loop() {
     let mut gate = Gate::new();
     let mut yin = Yin48k::new();
 
+    // Phase 3 Plan 03-04: four shaping stages constructed off-RT, mirroring the
+    // worker. Seed 0x12345678 per D-50. The four shaping stages all live inside
+    // the strict no-alloc block alongside the Phase 2 surface; Task 3's YIN fix
+    // is what allows the assertion below to PASS.
+    let mut deesser = DeEsser::new(ENGINE_SR as f32);
+    let mut brightness = BrightnessShelf::new(ENGINE_SR as f32);
+    let mut breath = Breathiness::new(ENGINE_SR as f32, 0x12345678);
+
     // Stack-allocated scratch + processed + f0_window buffers — same shape as the worker.
     let mut scratch: [f32; BLOCK] = [0.0; BLOCK];
     let mut processed: [f32; BLOCK] = [0.0; BLOCK];
+    // Phase 3 Plan 03-04: four NEW inter-stage scratch buffers mirroring the
+    // worker's stack layout (RESEARCH §Stack Scratch Buffer Layout).
+    let mut stretch_out: [f32; BLOCK] = [0.0; BLOCK];
+    let mut deess_out: [f32; BLOCK] = [0.0; BLOCK];
+    let mut bright_out: [f32; BLOCK] = [0.0; BLOCK];
+    let mut breath_out: [f32; BLOCK] = [0.0; BLOCK];
     let mut f0_window: [f32; 512] = [0.0; 512];
     let mut samples_since_f0: usize = 0;
 
@@ -233,12 +258,12 @@ fn assert_no_alloc_loop() {
         let target_pitch = TARGET_PITCH_RATIO;
         let target_formant = TARGET_FORMANT_RATIO;
 
-        // --- THE STRICT NO-ALLOC HOT PATH (mirrors worker.rs lines 281-331 verbatim). ---
+        // --- THE STRICT NO-ALLOC HOT PATH (mirrors worker.rs Plan 03-04 reshape). ---
+        // Phase 3 Plan 03-04 Task 2 extension: full 5-stage chain runs inside the
+        // strict block. Targets for the four shaping stages use the D-44..D-47
+        // ship-time defaults from `default_voice` (effectively constant — this
+        // test gates allocation, not behavior). All enables=true.
         assert_no_alloc(|| {
-            // Plan 03-01: smoothed.step widened to 6 targets. The four new placeholders
-            // (breath / brightness_db / sibilance / mix) read from the off-RT-defined
-            // `default_voice` binding so the smoothed values for the four new fields
-            // stay at constant === ship-time defaults. Allocation gate unaffected.
             smoothed.step(
                 target_pitch,
                 target_formant,
@@ -253,9 +278,36 @@ fn assert_no_alloc_loop() {
             let raw_rms_inner = tele.input_rms.load(Ordering::Relaxed);
             let gate_open = gate.update(raw_rms_inner);
 
-            stretch.process(&scratch, &mut processed);
+            // D-40 chain order LOCKED.
+            stretch.process(&scratch, &mut stretch_out);
+            deesser.process(
+                &stretch_out,
+                &mut deess_out,
+                smoothed.sibilance(),
+                default_voice.sibilance_tame_enabled,
+                ENGINE_SR as f32,
+            );
+            brightness.process(
+                &deess_out,
+                &mut bright_out,
+                smoothed.brightness_db(),
+                default_voice.brightness_enabled,
+                ENGINE_SR as f32,
+            );
+            breath.process(
+                &bright_out,
+                &mut breath_out,
+                smoothed.breathiness(),
+                default_voice.breathiness_enabled,
+                tele.output_f0_hz.load(Ordering::Relaxed),
+            );
+
+            // D-29 + D-51 gate-closed: hard zero AFTER stages, dry/wet mix on
+            // gate-open. D-43 endpoints: dry=scratch (raw), wet=breath_out.
             if !gate_open {
                 processed.fill(0.0);
+            } else {
+                dry_wet_mix(&scratch, &breath_out, smoothed.mix(), &mut processed);
             }
 
             // YIN subsample tick — only fires once per F0_INTERVAL_SAMPLES (≈ 30 Hz). At
@@ -308,6 +360,10 @@ fn assert_no_alloc_loop() {
     // Keep the buffers + atomics live so the optimizer cannot elide the work above.
     std::hint::black_box(&scratch);
     std::hint::black_box(&processed);
+    std::hint::black_box(&stretch_out);
+    std::hint::black_box(&deess_out);
+    std::hint::black_box(&bright_out);
+    std::hint::black_box(&breath_out);
     std::hint::black_box(&f0_window);
     std::hint::black_box(&tele);
     std::hint::black_box(&hot);
