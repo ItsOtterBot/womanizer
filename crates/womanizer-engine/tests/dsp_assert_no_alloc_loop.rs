@@ -88,7 +88,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use assert_no_alloc::{assert_no_alloc, reset_violation_count, violation_count};
-use womanizer_core::{HotParams, Preset, Telemetry};
+use womanizer_core::{HotParams, Preset, Telemetry, VoiceParams};
 use womanizer_engine::dsp::{Gate, SmoothedVoiceParams, Stretch48k, Yin48k};
 use womanizer_engine::BLOCK;
 
@@ -145,7 +145,21 @@ fn assert_no_alloc_loop() {
     stretch.set_transpose(TARGET_PITCH_RATIO);
     stretch.set_formant(TARGET_FORMANT_RATIO);
 
-    let mut smoothed = SmoothedVoiceParams::new(TARGET_PITCH_RATIO, TARGET_FORMANT_RATIO, BLOCK, 30.0);
+    // Plan 03-01: SmoothedVoiceParams::new widened to take `&VoiceParams`. Build a
+    // VoiceParams whose pitch_semitones/formant_semitones decode to TARGET_PITCH_RATIO and
+    // TARGET_FORMANT_RATIO via the `12 * log2(ratio)` inverse of `semitones_to_ratio`.
+    // Other Phase 3 shaping fields stay at VoiceParams::default() — the test still has
+    // an effective constant `target == current` smoother for the four new params (this
+    // test's gate is allocation-freedom, not behavior; constant smoothed values are fine).
+    // The placeholder targets fed to `smoothed.step` later use the same `default_voice`
+    // pattern so the smoothed values stay constant and the test continues to gate
+    // allocation only.
+    let default_voice = VoiceParams {
+        pitch_semitones: 12.0 * TARGET_PITCH_RATIO.log2(),
+        formant_semitones: 12.0 * TARGET_FORMANT_RATIO.log2(),
+        ..VoiceParams::default()
+    };
+    let mut smoothed = SmoothedVoiceParams::new(&default_voice, BLOCK, 30.0);
     let mut gate = Gate::new();
     let mut yin = Yin48k::new();
 
@@ -221,7 +235,18 @@ fn assert_no_alloc_loop() {
 
         // --- THE STRICT NO-ALLOC HOT PATH (mirrors worker.rs lines 281-331 verbatim). ---
         assert_no_alloc(|| {
-            smoothed.step(target_pitch, target_formant);
+            // Plan 03-01: smoothed.step widened to 6 targets. The four new placeholders
+            // (breath / brightness_db / sibilance / mix) read from the off-RT-defined
+            // `default_voice` binding so the smoothed values for the four new fields
+            // stay at constant === ship-time defaults. Allocation gate unaffected.
+            smoothed.step(
+                target_pitch,
+                target_formant,
+                default_voice.breathiness,
+                default_voice.brightness_db,
+                default_voice.sibilance_tame,
+                default_voice.mix,
+            );
             stretch.set_transpose(smoothed.pitch());
             stretch.set_formant(smoothed.formant());
 

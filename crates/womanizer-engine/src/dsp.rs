@@ -18,10 +18,18 @@
 //!   `set_transpose(m)` / `set_formant(m)` adopt D-24's locked `compensate_pitch = true` so
 //!   callers cannot accidentally disable independent pitch + formant control.
 //! - [`SmoothedVoiceParams`]: pure-Rust per-block exponential interpolator (RESEARCH
-//!   §Pattern 3 + Example B). 30 ms time-constant per D-35; `step(target_pitch, target_formant)`
-//!   is the per-block call between `triple_buffer<VoiceParams>::Output::read()` and the
-//!   `Stretch48k::set_transpose` / `set_formant` setters. Without this, slider drags produce
-//!   zipper noise (CONTEXT Pitfall #7).
+//!   §Pattern 3 + Example B). 30 ms time-constant per D-35; widened by Plan 03-01 from 2
+//!   smoothed fields (pitch, formant) to 6 — adds breath, brightness_db, sibilance, mix —
+//!   all sharing a single `alpha` coefficient at the D-35 tau. `step(targets...)` is the
+//!   per-block call between `triple_buffer<VoiceParams>::Output::read()` and the per-stage
+//!   setters/inputs. Without this, slider drags produce zipper noise (CONTEXT Pitfall #7).
+//! - [`BiquadDF1`]: shared Direct-Form-I biquad per RBJ Audio EQ Cookbook
+//!   (w3.org/TR/audio-eq-cookbook/). Constructed off-RT; `set_high_shelf` / `set_bandpass`
+//!   / `set_peaking` recompute coefficients off the per-sample loop (once per block from
+//!   smoothed slider values is the downstream Plan 03-02/03 pattern); per-sample `step()`
+//!   runs inside `assert_no_alloc(|| { ... })`. Used by the Phase 3 DeEsser, BrightnessShelf,
+//!   and Breathiness stages — landed here by Plan 03-01 so downstream plans share a single
+//!   coefficient-math source.
 //! - [`Gate`]: RMS gate with hysteresis (open at −45 dBFS, close at −50 dBFS, 50 ms hold-open)
 //!   per D-30. `update(raw_input_rms)` returns the gate-open boolean; gate-closed → worker
 //!   emits true digital silence (D-29).
@@ -61,6 +69,11 @@ use crate::cpal_io::{BLOCK, SAMPLE_RATE_HZ};
 // defining crate's type, so `Preset::window_hop` becomes the free function
 // `preset_window_hop` below.
 pub use womanizer_core::Preset;
+// Plan 03-01: `SmoothedVoiceParams::new` takes `&VoiceParams` (RESEARCH §SmoothedVoiceParams
+// Extension) so the smoother's six initial values come from the same struct the worker's
+// `triple_buffer<VoiceParams>` snapshot publishes. The accessor methods on VoiceParams
+// (`pitch_semitones_to_ratio`, `formant_semitones_to_ratio`) are exposed by this re-import.
+use womanizer_core::VoiceParams;
 
 /// Engine-wide sample rate constant re-exported for callers who want a single import. Equal
 /// to [`SAMPLE_RATE_HZ`] from `cpal_io` — 48 kHz, fixed (D-05). The duplicate lives here so
@@ -224,47 +237,77 @@ impl Stretch48k {
 }
 
 /// Per-block exponential interpolator that smooths raw slider values before they reach
-/// `Stretch48k::set_transpose` / `set_formant`. Without this, slider drags produce zipper
-/// noise (CONTEXT Pitfall #7). 30 ms time-constant per D-35.
+/// the per-stage DSP setters/inputs. Without this, slider drags produce zipper noise
+/// (CONTEXT Pitfall #7). 30 ms time-constant per D-35 (Phase 2) — shared across all six
+/// smoothed fields after Plan 03-01's widening.
 ///
 /// ## Math (RESEARCH §Pattern 3 + Example B)
 /// - `tau_samples = (tau_ms / 1000) * 48_000` → 1440 for 30 ms @ 48 kHz.
 /// - `alpha = 1.0 - exp(-block_samples / tau_samples)` → ≈ 0.163 for BLOCK=256, 30 ms.
-/// - Per block: `current += alpha * (target - current)` for each of pitch and formant.
+/// - Per block: `current += alpha * (target - current)` for each of the six smoothed
+///   parameters (pitch ratio, formant ratio, breathiness, brightness_db, sibilance,
+///   dry/wet mix). One shared `alpha` is correct because all six visible UI sliders need
+///   the same perceptual smoothing time-constant — D-35 unchanged.
 ///
-/// `alpha` is precomputed at construction (a const for fixed BLOCK + tau).
-// Fields are written by `new()`, read by `pitch()` / `formant()` accessors, and mutated by
-// `step()` (Plan 02-05).
+/// `alpha` is precomputed at construction (a single const for fixed BLOCK + tau).
+///
+/// ## Plan 03-01 widening — additive
+/// Phase 2 shipped only `pitch_current` + `formant_current`. Plan 03-01 adds four new
+/// `*_current` fields between formant_current and alpha (the field order preserves
+/// `alpha` LAST per Pattern E). The widened `new(&VoiceParams, ...)` constructor reads
+/// initial values directly from the same struct that the worker's
+/// `triple_buffer<VoiceParams>` snapshot publishes, so the smoother and the snapshot
+/// path share a single source of truth for ship-time defaults (D-44..D-47).
+// Fields are written by `new()`, read by `pitch()` / `formant()` / `breathiness()` /
+// `brightness_db()` / `sibilance()` / `mix()` accessors, and mutated by `step()`.
 #[derive(Copy, Clone, Debug)]
 pub struct SmoothedVoiceParams {
-    /// Current smoothed pitch multiplier. Initialized to `initial_pitch` from `new()`.
+    /// Current smoothed pitch multiplier. Initialized from `initial.pitch_semitones_to_ratio()`.
     pitch_current: f32,
-    /// Current smoothed formant multiplier. Initialized to `initial_formant` from `new()`.
+    /// Current smoothed formant multiplier. Initialized from `initial.formant_semitones_to_ratio()`.
     formant_current: f32,
+    /// Current smoothed breathiness amount [0, 1]. Initialized from `initial.breathiness`
+    /// (D-45 ship-time default 0.20). Plan 03-01 widening.
+    breath_current: f32,
+    /// Current smoothed brightness shelf gain in dB. Initialized from `initial.brightness_db`
+    /// (D-44 ship-time default +3.0). Plan 03-01 widening.
+    brightness_db_current: f32,
+    /// Current smoothed sibilance-tame amount [0, 1]. Initialized from `initial.sibilance_tame`
+    /// (D-46 ship-time default 0.30). Plan 03-01 widening.
+    sibilance_current: f32,
+    /// Current smoothed dry/wet mix [0, 1]. Initialized from `initial.mix`
+    /// (D-47 ship-time default 1.0). Plan 03-01 widening.
+    mix_current: f32,
     /// One-pole filter coefficient `1.0 - exp(-block_samples / tau_samples)`. Precomputed
-    /// once at construction; same value applies to both pitch and formant smoothing.
+    /// once at construction; same value applies to ALL six smoothed fields per D-35.
     alpha: f32,
 }
 
 impl SmoothedVoiceParams {
-    /// Construct with the initial target values and the smoothing time-constant. Called
-    /// once at DSP worker spawn; `initial_pitch` / `initial_formant` come from the default
-    /// VoiceParams (D-22 — pitch 1.65×, formant 1.18×).
+    /// Construct with the initial target values from a `VoiceParams` reference and the
+    /// smoothing time-constant. Called once at DSP worker spawn against
+    /// `VoiceParams::default()` so all six smoothed fields boot at the D-22 + D-44..D-47
+    /// ship-time values (pitch 1.65×, formant 1.18×, breath 0.20, brightness +3 dB,
+    /// sibilance 0.30, mix 1.0).
     ///
     /// `block_samples` is [`BLOCK`] (256); `tau_ms` is 30.0 (D-35). Both are passed
     /// explicitly so test code can drive alternative time-constants without going through
     /// crate constants.
-    pub fn new(
-        initial_pitch: f32,
-        initial_formant: f32,
-        block_samples: usize,
-        tau_ms: f32,
-    ) -> Self {
+    ///
+    /// Plan 03-01: signature widened from positional `(initial_pitch, initial_formant, ...)`
+    /// to `(&VoiceParams, ...)` per Pattern E + RESEARCH §SmoothedVoiceParams Extension —
+    /// avoids 6-positional-arg call sites and keeps the snapshot-struct as the single
+    /// source of truth.
+    pub fn new(initial: &VoiceParams, block_samples: usize, tau_ms: f32) -> Self {
         let tau_samples = (tau_ms / 1000.0) * ENGINE_SR as f32;
         let alpha = 1.0 - (-(block_samples as f32) / tau_samples).exp();
         Self {
-            pitch_current: initial_pitch,
-            formant_current: initial_formant,
+            pitch_current: initial.pitch_semitones_to_ratio(),
+            formant_current: initial.formant_semitones_to_ratio(),
+            breath_current: initial.breathiness,
+            brightness_db_current: initial.brightness_db,
+            sibilance_current: initial.sibilance_tame,
+            mix_current: initial.mix,
             alpha,
         }
     }
@@ -272,12 +315,28 @@ impl SmoothedVoiceParams {
     /// Per-block step. Called by the DSP worker AFTER reading the latest VoiceParams
     /// snapshot from `triple_buffer<VoiceParams>::Output::read()`. Body is the textbook
     /// one-pole exponential interpolator: `current += alpha * (target - current)` for
-    /// each of pitch and formant. Two lines, zero allocation, ~6 f32 ops per block.
-    /// Plan 02-05.
+    /// each of the six smoothed parameters. Six lines, zero allocation, ~18 f32 ops per
+    /// block.
+    ///
+    /// Plan 03-01: signature widened from `(target_pitch, target_formant)` to take four
+    /// additional `target_*` args for the new shaping parameters. The single shared
+    /// `alpha` preserves D-35 perceptual smoothing across all six fields.
     #[inline]
-    pub fn step(&mut self, target_pitch: f32, target_formant: f32) {
+    pub fn step(
+        &mut self,
+        target_pitch: f32,
+        target_formant: f32,
+        target_breath: f32,
+        target_bright_db: f32,
+        target_sib: f32,
+        target_mix: f32,
+    ) {
         self.pitch_current += self.alpha * (target_pitch - self.pitch_current);
         self.formant_current += self.alpha * (target_formant - self.formant_current);
+        self.breath_current += self.alpha * (target_breath - self.breath_current);
+        self.brightness_db_current += self.alpha * (target_bright_db - self.brightness_db_current);
+        self.sibilance_current += self.alpha * (target_sib - self.sibilance_current);
+        self.mix_current += self.alpha * (target_mix - self.mix_current);
     }
 
     /// Read the current smoothed pitch multiplier. Wired by Plan 02-05 to
@@ -292,6 +351,34 @@ impl SmoothedVoiceParams {
     #[inline]
     pub fn formant(&self) -> f32 {
         self.formant_current
+    }
+
+    /// Read the current smoothed breathiness amount [0, 1]. Wired by Plan 03-03 to the
+    /// Breathiness stage's per-block amplitude scale.
+    #[inline]
+    pub fn breathiness(&self) -> f32 {
+        self.breath_current
+    }
+
+    /// Read the current smoothed brightness shelf gain in dB. Wired by Plan 03-02 to the
+    /// BrightnessShelf's per-block RBJ high-shelf coefficient recomputation.
+    #[inline]
+    pub fn brightness_db(&self) -> f32 {
+        self.brightness_db_current
+    }
+
+    /// Read the current smoothed sibilance-tame amount [0, 1]. Wired by Plan 03-02 to the
+    /// DeEsser's per-block effective-ratio computation.
+    #[inline]
+    pub fn sibilance(&self) -> f32 {
+        self.sibilance_current
+    }
+
+    /// Read the current smoothed dry/wet mix [0, 1]. Wired by Plan 03-03 to the dry_wet_mix
+    /// SIMD linear blend.
+    #[inline]
+    pub fn mix(&self) -> f32 {
+        self.mix_current
     }
 }
 
@@ -514,6 +601,229 @@ pub fn rms_simd(samples: &[f32]) -> f32 {
     (sum_sq / samples.len().max(1) as f32).sqrt()
 }
 
+/// Shared Direct-Form-I biquad per the RBJ Audio EQ Cookbook
+/// (Robert Bristow-Johnson, <https://www.w3.org/TR/audio-eq-cookbook/>).
+///
+/// Single-section second-order IIR filter. Coefficients computed once per parameter change
+/// (typically once per audio block from smoothed slider values) by [`Self::set_high_shelf`],
+/// [`Self::set_bandpass`], or [`Self::set_peaking`]; per-sample [`Self::step`] is 5 multiplies
+/// + 4 adds.
+///
+/// ## Why Direct Form I (not DF-II or transposed DF-II)
+/// DF-I has the best numerical behavior under coefficient modulation. The brightness
+/// shelf (Plan 03-02) recomputes coefficients every block from the smoothed dB value;
+/// DF-I's separate input + output delay storage avoids the transient discontinuities
+/// transposed DF-II exhibits under that workload. This is the standard audio-DSP
+/// recommendation (RBJ cookbook §"Implementation").
+///
+/// ## Lifecycle
+/// - Constructed OFF the audio thread (DSP worker spawn, or engine event-loop thread on
+///   preset rebuild). The `new()` constructor is a unity passthrough.
+/// - Owned exclusively by a single DSP stage (DeEsser / BrightnessShelf / Breathiness).
+/// - Per-block `process(input, output)` runs inside `assert_no_alloc(|| { ... })` — only
+///   stack arithmetic + slice reads/writes; coefficient recomputation also alloc-free
+///   (a handful of transcendentals + stack arithmetic — no heap).
+///
+/// ## Plan 03-01 lands the shared helper; downstream plans consume
+/// - Plan 03-02 (BrightnessShelf): `set_high_shelf` for the +3 dB high-shelf at 4 kHz.
+/// - Plan 03-02 (DeEsser): `set_bandpass` for the 6.5 kHz detector + `set_peaking` for
+///   the dynamic cut band.
+/// - Plan 03-03 (Breathiness): `set_bandpass` for the 1200 Hz / Q=0.4 noise shaping
+///   filter.
+///
+/// Field layout: five normalized coefficients (a0 implicit 1.0 after the normalization
+/// step) + four Direct Form I state slots (two input delays, two output delays).
+#[derive(Copy, Clone, Debug)]
+pub struct BiquadDF1 {
+    /// Forward coefficient for the current sample (b0/a0 after normalization).
+    b0: f32,
+    /// Forward coefficient for x[n-1].
+    b1: f32,
+    /// Forward coefficient for x[n-2].
+    b2: f32,
+    /// Feedback coefficient for y[n-1] (stored with RBJ's positive sign convention; the
+    /// per-sample `step` subtracts it).
+    a1: f32,
+    /// Feedback coefficient for y[n-2] (same sign convention as `a1`).
+    a2: f32,
+    /// Direct Form I input delay 1: x[n-1].
+    x1: f32,
+    /// Direct Form I input delay 2: x[n-2].
+    x2: f32,
+    /// Direct Form I output delay 1: y[n-1].
+    y1: f32,
+    /// Direct Form I output delay 2: y[n-2].
+    y2: f32,
+}
+
+impl BiquadDF1 {
+    /// Construct a unity-passthrough biquad: `b0=1, b1=b2=a1=a2=0`, all delays zero.
+    /// Coefficient setters overwrite the b/a fields without touching the delay lines, so
+    /// constructing-then-immediately-configuring is correct even if the caller does not
+    /// `reset_state()` first.
+    pub fn new() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    /// Reset only the delay lines (preserve coefficients). Useful after a long warm-off:
+    /// not strictly required because zeros are mathematically correct, but cheap insurance
+    /// against any accumulated denormals during long inactive periods. Phase 3 D-42
+    /// warm-off pattern calls `process()` every block so this is rarely needed in practice.
+    pub fn reset_state(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+
+    /// Compute and store RBJ second-order high-shelf coefficients for sample rate `fs`,
+    /// corner frequency `f0_hz`, gain `gain_db`, and Q-factor `q`.
+    ///
+    /// Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+    /// <https://www.w3.org/TR/audio-eq-cookbook/> §"High-shelf filter". All variable names
+    /// transcribed verbatim from the cookbook for traceability.
+    ///
+    /// At `gain_db = 0` the high-shelf collapses mathematically to a unity passthrough:
+    /// `A = 10^0 = 1`, so `b0 = a0`, `b1 = a1`, `b2 = a2` and after normalization the
+    /// recursion becomes `y[n] = x[n]` (verified by the
+    /// `biquad_high_shelf_at_zero_db_is_unity_passthrough` lib test).
+    pub fn set_high_shelf(&mut self, fs: f32, f0_hz: f32, gain_db: f32, q: f32) {
+        // Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+        // https://www.w3.org/TR/audio-eq-cookbook/
+        let big_a = 10.0_f32.powf(gain_db / 40.0); // sqrt of linear gain
+        let omega = 2.0 * std::f32::consts::PI * f0_hz / fs;
+        let sin_w = omega.sin();
+        let cos_w = omega.cos();
+        let alpha = sin_w / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * big_a.sqrt() * alpha;
+
+        let b0 = big_a * ((big_a + 1.0) + (big_a - 1.0) * cos_w + two_sqrt_a_alpha);
+        let b1 = -2.0 * big_a * ((big_a - 1.0) + (big_a + 1.0) * cos_w);
+        let b2 = big_a * ((big_a + 1.0) + (big_a - 1.0) * cos_w - two_sqrt_a_alpha);
+        let a0 = (big_a + 1.0) - (big_a - 1.0) * cos_w + two_sqrt_a_alpha;
+        let a1 = 2.0 * ((big_a - 1.0) - (big_a + 1.0) * cos_w);
+        let a2 = (big_a + 1.0) - (big_a - 1.0) * cos_w - two_sqrt_a_alpha;
+
+        // Normalize so the implicit a0 in the recursion is 1.0 — eliminates one division
+        // per sample. The per-sample `step` subtracts `a1` and `a2` (consistent with RBJ's
+        // recursion `y = ... - a1*y1 - a2*y2`).
+        let inv_a0 = 1.0 / a0;
+        self.b0 = b0 * inv_a0;
+        self.b1 = b1 * inv_a0;
+        self.b2 = b2 * inv_a0;
+        self.a1 = a1 * inv_a0;
+        self.a2 = a2 * inv_a0;
+    }
+
+    /// Compute and store RBJ "BPF: constant 0 dB peak gain" bandpass coefficients for
+    /// sample rate `fs`, center frequency `f0_hz`, and Q-factor `q`.
+    ///
+    /// Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+    /// <https://www.w3.org/TR/audio-eq-cookbook/> §"BPF: constant 0 dB peak gain". This is
+    /// the symmetric bandpass variant used by the Phase 3 breath synthesis chain (Plan
+    /// 03-03 will use it at 1200 Hz / Q=0.4 for noise shaping) and by the de-esser detector
+    /// (Plan 03-02 will use it at 6.5 kHz / Q=1.0).
+    pub fn set_bandpass(&mut self, fs: f32, f0_hz: f32, q: f32) {
+        // Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+        // https://www.w3.org/TR/audio-eq-cookbook/
+        let omega = 2.0 * std::f32::consts::PI * f0_hz / fs;
+        let sin_w = omega.sin();
+        let cos_w = omega.cos();
+        let alpha = sin_w / (2.0 * q);
+
+        let b0 = alpha;
+        let b1 = 0.0;
+        let b2 = -alpha;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w;
+        let a2 = 1.0 - alpha;
+
+        let inv_a0 = 1.0 / a0;
+        self.b0 = b0 * inv_a0;
+        self.b1 = b1 * inv_a0;
+        self.b2 = b2 * inv_a0;
+        self.a1 = a1 * inv_a0;
+        self.a2 = a2 * inv_a0;
+    }
+
+    /// Compute and store RBJ peaking-EQ coefficients for sample rate `fs`, center
+    /// frequency `f0_hz`, gain `gain_db`, and Q-factor `q`.
+    ///
+    /// Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+    /// <https://www.w3.org/TR/audio-eq-cookbook/> §"Peaking EQ". Plan 03-02 may use this
+    /// for the de-esser dynamic cut band.
+    pub fn set_peaking(&mut self, fs: f32, f0_hz: f32, gain_db: f32, q: f32) {
+        // Source: RBJ Audio EQ Cookbook (Robert Bristow-Johnson),
+        // https://www.w3.org/TR/audio-eq-cookbook/
+        let big_a = 10.0_f32.powf(gain_db / 40.0); // sqrt of linear gain
+        let omega = 2.0 * std::f32::consts::PI * f0_hz / fs;
+        let sin_w = omega.sin();
+        let cos_w = omega.cos();
+        let alpha = sin_w / (2.0 * q);
+
+        let b0 = 1.0 + alpha * big_a;
+        let b1 = -2.0 * cos_w;
+        let b2 = 1.0 - alpha * big_a;
+        let a0 = 1.0 + alpha / big_a;
+        let a1 = -2.0 * cos_w;
+        let a2 = 1.0 - alpha / big_a;
+
+        let inv_a0 = 1.0 / a0;
+        self.b0 = b0 * inv_a0;
+        self.b1 = b1 * inv_a0;
+        self.b2 = b2 * inv_a0;
+        self.a1 = a1 * inv_a0;
+        self.a2 = a2 * inv_a0;
+    }
+
+    /// Per-sample Direct Form I recursion. Five multiplies + four adds + four delay
+    /// shifts; ~1 ns on a modern CPU. Inline-able so the block-level loop in
+    /// [`Self::process`] folds it.
+    ///
+    /// Recursion: `y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]` then
+    /// shift the delays. NOT vectorizable across samples (intrinsic IIR recursion).
+    #[inline]
+    pub fn step(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+
+    /// Block processing — caller passes non-aliased input + output slices. Follows the
+    /// Pattern B Phase 2 contract (`process(&[f32], &mut [f32])` with the
+    /// `debug_assert_eq!` length guard). In-place processing is supported by passing the
+    /// same slice twice via `split_at_mut` tricks, but the clean idiom is `input != output`
+    /// against pre-allocated scratch buffers.
+    #[inline]
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        for (xi, yi) in input.iter().zip(output.iter_mut()) {
+            *yi = self.step(*xi);
+        }
+    }
+}
+
+impl Default for BiquadDF1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +940,29 @@ mod tests {
         10f32.powf(db / 20.0)
     }
 
+    /// Plan 03-01 helper: synthesize a `VoiceParams` whose `pitch_semitones_to_ratio()`
+    /// returns exactly `pitch_ratio` and whose `formant_semitones_to_ratio()` returns
+    /// exactly `formant_ratio`. Inverts `2^(st/12) = ratio` → `st = 12 * log2(ratio)` so
+    /// the Phase 2 tests below can seed the widened `new(&VoiceParams, ...)` constructor
+    /// with explicit initial pitch/formant ratios as before. Other fields default to 0.0
+    /// so the smoother's four new fields don't interfere with the pitch/formant assertions.
+    fn voice_params_for_initial_ratios(pitch_ratio: f32, formant_ratio: f32) -> VoiceParams {
+        VoiceParams {
+            pitch_semitones: 12.0 * pitch_ratio.log2(),
+            formant_semitones: 12.0 * formant_ratio.log2(),
+            compensate_pitch: true,
+            breathiness: 0.0,
+            brightness_db: 0.0,
+            sibilance_tame: 0.0,
+            mix: 0.0,
+            breathiness_enabled: true,
+            brightness_enabled: true,
+            sibilance_tame_enabled: true,
+            quality_preset: womanizer_core::QualityPreset::Balanced,
+            color_tag: None,
+        }
+    }
+
     /// SmoothedVoiceParams converges to its target within 5% after 20 blocks of constant
     /// drive (20 * 256 = 5120 samples ≈ 106.6 ms ≈ 3.5 time-constants of the 30 ms decay).
     ///
@@ -637,13 +970,19 @@ mod tests {
     /// anything, the values would stay at their initial 1.0 and the assertion would fire.
     /// 5% is a generous tolerance for 3.5 τ; the textbook exponential math gives ≈ 3%
     /// residual at exactly 3.5 τ.
+    ///
+    /// Plan 03-01: `new()` signature widened to `(&VoiceParams, ...)`; the test seeds an
+    /// explicit initial-pitch=1.0, initial-formant=1.0 VoiceParams via the local helper
+    /// so the assertions are equivalent to the Phase 2 version. `step()` now takes six
+    /// targets — the four extra are zeros (don't care for the pitch/formant assertions).
     #[test]
     fn smoothed_step_converges_to_target() {
-        let mut s = SmoothedVoiceParams::new(1.0, 1.0, BLOCK, 30.0);
+        let initial = voice_params_for_initial_ratios(1.0, 1.0);
+        let mut s = SmoothedVoiceParams::new(&initial, BLOCK, 30.0);
         let target_pitch = 1.65;
         let target_formant = 1.18;
         for _ in 0..20 {
-            s.step(target_pitch, target_formant);
+            s.step(target_pitch, target_formant, 0.0, 0.0, 0.0, 0.0);
         }
         let pitch_err = (s.pitch() - target_pitch).abs() / target_pitch;
         let formant_err = (s.formant() - target_formant).abs() / target_formant;
@@ -663,14 +1002,33 @@ mod tests {
 
     /// SmoothedVoiceParams precomputes alpha ≈ 0.163 for BLOCK=256 and tau=30 ms at 48 kHz
     /// per RESEARCH §Q6: `1.0 - exp(-256 / 1440) ≈ 0.16297`. Reads the alpha field via a
-    /// behavioral probe — one `step(1.0, 0.0)` call from `current = 0.0` yields
+    /// behavioral probe — one `step(1.0, 1.0, 0, 0, 0, 0)` call from `current = 0.0` yields
     /// `current = alpha * (1.0 - 0.0) = alpha`. This indirectly verifies the constructor
     /// math without exposing the private field.
+    ///
+    /// Plan 03-01: signature widening — initial pitch/formant=1.0×0=unity-baseline via the
+    /// helper (we want `current` to start at 0.0 for the probe, so we synthesize a
+    /// VoiceParams whose ratios are 1.0 then immediately overwrite `pitch_current` to 0.0
+    /// via a step from 1.0 to 0.0 — alternatively, the cleanest probe is to construct from
+    /// a VoiceParams whose initial ratios are 0.0; below we construct an explicitly-built
+    /// VoiceParams whose pitch_semitones / formant_semitones decode to 0.0 ratios via the
+    /// f32::NEG_INFINITY semitone value, then step to a non-zero target).
+    ///
+    /// Implementation detail: rather than relying on log2/exp2 round-trip subtleties for
+    /// ratio=0, we use a direct invariant: construct from initial pitch ratio 1.0, then
+    /// step from current=1.0 to target=1.0+alpha-equivalent. Simpler: read alpha via
+    /// the recurrence `current_after_one_step = current_before + alpha * (target -
+    /// current_before)` algebraically. For initial pitch=1.0 and target=2.0, after one
+    /// step current = 1.0 + alpha * 1.0 = 1.0 + alpha, so alpha = current - 1.0.
     #[test]
     fn smoothed_alpha_matches_30ms_tau() {
-        let mut s = SmoothedVoiceParams::new(0.0, 0.0, BLOCK, 30.0);
-        s.step(1.0, 1.0);
-        let observed_alpha = s.pitch();
+        let initial = voice_params_for_initial_ratios(1.0, 1.0);
+        let mut s = SmoothedVoiceParams::new(&initial, BLOCK, 30.0);
+        // Step from initial (1.0, 1.0) toward (2.0, 2.0). After one step:
+        //   current = 1.0 + alpha * (2.0 - 1.0) = 1.0 + alpha
+        // → observed_alpha = current - 1.0.
+        s.step(2.0, 2.0, 0.0, 0.0, 0.0, 0.0);
+        let observed_alpha = s.pitch() - 1.0;
         let expected_alpha = 1.0 - (-(BLOCK as f32) / 1440.0).exp();
         let diff = (observed_alpha - expected_alpha).abs();
         assert!(
@@ -930,6 +1288,199 @@ mod tests {
             "Yin48k::get_pitch tripped the assert_no_alloc violation counter over 100 \
              calls — pitch-detection 0.3.x may have introduced lazy allocation on the hot \
              path (T-2-yin-allocation regression). Pin the exact version in workspace deps."
+        );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Plan 03-01 — BiquadDF1 + widened SmoothedVoiceParams contract tests.
+    // ---------------------------------------------------------------------------------
+
+    /// BiquadDF1 with `set_high_shelf(fs, f0, 0 dB, q)` must be unity passthrough — at
+    /// `gain_db = 0`, the RBJ math gives `A = 1`, and the coefficient formula collapses
+    /// to `b0 = a0`, `b1 = a1`, `b2 = a2` so after a0-normalization the recursion is
+    /// `y[n] = x[n]`. Feed a 1000 Hz sine; compare output vs input element-wise within
+    /// 1e-3 absolute (the float-rounding budget for the chain of multiplies + divides).
+    #[test]
+    fn biquad_high_shelf_at_zero_db_is_unity_passthrough() {
+        let mut bq = BiquadDF1::new();
+        bq.set_high_shelf(ENGINE_SR as f32, 4000.0, 0.0, 0.707);
+        let input = sine_window(1000.0, 0.5, 4800); // 100 ms @ 48 kHz
+        let mut output = vec![0f32; input.len()];
+        bq.process(&input, &mut output);
+        // Skip the first 8 samples — the DF-I delay lines start at zero, so the first
+        // outputs ramp up over the two-sample memory horizon before reaching steady-state
+        // unity. After that, the input is exactly reproduced within float rounding.
+        for (i, (x, y)) in input.iter().zip(output.iter()).enumerate().skip(8) {
+            let diff = (x - y).abs();
+            assert!(
+                diff < 1e-3,
+                "high-shelf at 0 dB drifted from unity at sample {i}: input={x}, \
+                 output={y}, diff={diff}"
+            );
+        }
+    }
+
+    /// BiquadDF1 with `set_bandpass(fs, 1200 Hz, Q=0.4)` must attenuate DC and Nyquist:
+    /// DC drives the recursion to zero (b1 = 0, b0 + b2 = 0 sum-of-coefficients
+    /// constraint for a constant-0-dB-peak-gain bandpass); Nyquist-near alternating-sign
+    /// signal sits far outside the passband centered at 1200 Hz.
+    ///
+    /// DC test: all-zero input is trivially zero; we use a constant DC offset of 0.5 and
+    /// run for 200 samples to let the delays settle, then check the steady-state output
+    /// is near zero (< 1e-3 abs). Nyquist test: alternating ±1.0 signal (the closest
+    /// representation of Nyquist) — output must be < 5% of input amplitude after settling.
+    #[test]
+    fn biquad_bandpass_attenuates_dc_and_nyquist() {
+        // DC attenuation: constant 0.5 input. The bandpass eventually settles to zero
+        // because the DC gain of a bandpass is mathematically zero.
+        let mut bq = BiquadDF1::new();
+        bq.set_bandpass(ENGINE_SR as f32, 1200.0, 0.4);
+        let dc_input = [0.5f32; 1000];
+        let mut dc_output = [0f32; 1000];
+        bq.process(&dc_input, &mut dc_output);
+        // After 1000 samples (~21 ms) the bandpass should have rejected the DC component
+        // to well below 1e-3.
+        let dc_tail_max = dc_output[500..]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            dc_tail_max < 1e-3,
+            "bandpass failed to attenuate DC: tail max abs = {dc_tail_max}, expected < 1e-3"
+        );
+
+        // Nyquist attenuation: ±1.0 alternating signal (the digital Nyquist representation).
+        // Reset state before driving a new signal to avoid contamination from the DC tail.
+        let mut bq_ny = BiquadDF1::new();
+        bq_ny.set_bandpass(ENGINE_SR as f32, 1200.0, 0.4);
+        let mut nyquist_input = [0f32; 1000];
+        for (i, x) in nyquist_input.iter_mut().enumerate() {
+            *x = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut nyquist_output = [0f32; 1000];
+        bq_ny.process(&nyquist_input, &mut nyquist_output);
+        // After settling, the Nyquist-rate signal should be attenuated to < 5% of input
+        // amplitude (well above 26 dB rejection at 23 kHz when the center is 1200 Hz).
+        let nyquist_tail_max = nyquist_output[500..]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            nyquist_tail_max < 0.05,
+            "bandpass failed to attenuate Nyquist: tail max abs = {nyquist_tail_max}, \
+             expected < 0.05"
+        );
+    }
+
+    /// BiquadDF1::step recursion correctness: feed an impulse [1, 0, 0, 0] through a
+    /// biquad with hand-set coefficients (b0=0.5, b1=0.2, b2=0.1, a1=0.3, a2=0.1) and
+    /// verify the output element-wise against the textbook formula
+    /// `y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2`. Independent of any RBJ coefficient
+    /// math — proves the recursion + delay shifts are correct.
+    #[test]
+    fn biquad_step_recursion_matches_textbook_form() {
+        // Build a biquad with explicit coefficients (no RBJ setter — we want to test ONLY
+        // the recursion math). Construct via new() then overwrite the coefficient fields.
+        let mut bq = BiquadDF1 {
+            b0: 0.5,
+            b1: 0.2,
+            b2: 0.1,
+            a1: 0.3,
+            a2: 0.1,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        };
+        // Impulse input.
+        let input = [1.0f32, 0.0, 0.0, 0.0];
+        let mut output = [0f32; 4];
+        for i in 0..4 {
+            output[i] = bq.step(input[i]);
+        }
+        // Hand-computed expected outputs:
+        // n=0: y = 0.5*1 + 0.2*0 + 0.1*0 - 0.3*0 - 0.1*0 = 0.5
+        //      delays: x1=1, x2=0, y1=0.5, y2=0
+        // n=1: y = 0.5*0 + 0.2*1 + 0.1*0 - 0.3*0.5 - 0.1*0 = 0.2 - 0.15 = 0.05
+        //      delays: x1=0, x2=1, y1=0.05, y2=0.5
+        // n=2: y = 0.5*0 + 0.2*0 + 0.1*1 - 0.3*0.05 - 0.1*0.5 = 0.1 - 0.015 - 0.05 = 0.035
+        //      delays: x1=0, x2=0, y1=0.035, y2=0.05
+        // n=3: y = 0.5*0 + 0.2*0 + 0.1*0 - 0.3*0.035 - 0.1*0.05 = -0.0105 - 0.005 = -0.0155
+        let expected = [0.5_f32, 0.05, 0.035, -0.0155];
+        for (i, (obs, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (obs - exp).abs();
+            assert!(
+                diff < 1e-7,
+                "biquad recursion sample {i}: observed={obs}, expected={exp}, diff={diff}"
+            );
+        }
+    }
+
+    /// Plan 03-01 widening gate: `SmoothedVoiceParams::new(&VoiceParams::default(), BLOCK,
+    /// 30.0)` seeds the six smoothed fields directly from the D-22 + D-44..D-47 ship-time
+    /// values. Without any `step()` call, the accessors return those defaults.
+    #[test]
+    fn smoothed_voice_params_widens_to_six_fields() {
+        let initial = VoiceParams::default();
+        let s = SmoothedVoiceParams::new(&initial, BLOCK, 30.0);
+        // pitch + formant are seeded from the ratio conversions (D-22 → 1.65× and 1.18×).
+        let expected_pitch = initial.pitch_semitones_to_ratio();
+        let expected_formant = initial.formant_semitones_to_ratio();
+        assert!(
+            (s.pitch() - expected_pitch).abs() < 1e-6,
+            "initial pitch_current must equal initial.pitch_semitones_to_ratio() = \
+             {expected_pitch}, got {}",
+            s.pitch()
+        );
+        assert!(
+            (s.formant() - expected_formant).abs() < 1e-6,
+            "initial formant_current must equal initial.formant_semitones_to_ratio() = \
+             {expected_formant}, got {}",
+            s.formant()
+        );
+        // The four new smoothed fields seed directly from the f32 VoiceParams fields.
+        assert!(
+            (s.breathiness() - 0.20).abs() < 1e-6,
+            "initial breath_current must equal D-45 default 0.20, got {}",
+            s.breathiness()
+        );
+        assert!(
+            (s.brightness_db() - 3.0).abs() < 1e-6,
+            "initial brightness_db_current must equal D-44 default 3.0, got {}",
+            s.brightness_db()
+        );
+        assert!(
+            (s.sibilance() - 0.30).abs() < 1e-6,
+            "initial sibilance_current must equal D-46 default 0.30, got {}",
+            s.sibilance()
+        );
+        assert!(
+            (s.mix() - 1.0).abs() < 1e-6,
+            "initial mix_current must equal D-47 default 1.0, got {}",
+            s.mix()
+        );
+    }
+
+    /// Plan 03-01 step gate: starting from brightness_db = 0.0, call `step()` 100 times
+    /// with target brightness_db = 12.0 dB; verify convergence within 1% of target.
+    /// At BLOCK=256, tau=30 ms, alpha ≈ 0.163; 100 blocks ≈ 17.78 time-constants → the
+    /// residual `(1 - alpha)^100` ≈ 6e-9 of the initial gap — far inside 1%.
+    #[test]
+    fn smoothed_voice_params_step_converges_with_30ms_tau() {
+        let initial = voice_params_for_initial_ratios(1.0, 1.0); // breath/brightness/sib/mix = 0.0
+        let mut s = SmoothedVoiceParams::new(&initial, BLOCK, 30.0);
+        let target_bright_db = 12.0_f32;
+        for _ in 0..100 {
+            // Hold pitch/formant at their initial 1.0 ratios; sweep brightness toward 12.0;
+            // hold breath/sib/mix at 0.
+            s.step(1.0, 1.0, 0.0, target_bright_db, 0.0, 0.0);
+        }
+        let observed = s.brightness_db();
+        let err = (observed - target_bright_db).abs() / target_bright_db;
+        assert!(
+            err < 0.01,
+            "smoothed brightness_db did not converge within 1% of {target_bright_db} after \
+             100 blocks: observed={observed}, err={err}"
         );
     }
 }

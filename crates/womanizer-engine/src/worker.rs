@@ -169,8 +169,14 @@ pub fn spawn_dsp_worker(
             // input RMS, evaluated off-RT) and the worker overwrites `processed` with
             // exact zeros when the gate is closed (D-29 true digital silence). Stretch48k
             // is STILL called every block regardless of gate state (D-28 warm contract).
-            let mut smoothed =
-                crate::dsp::SmoothedVoiceParams::new(initial_pitch, initial_formant, BLOCK, 30.0);
+            // Plan 03-01: SmoothedVoiceParams widened from 2 smoothed fields to 6 (adds
+            // breath/brightness_db/sibilance/mix). The `new()` signature now takes
+            // `&VoiceParams` so the smoother seeds its six initial values directly from
+            // the same struct the worker's triple_buffer<VoiceParams> snapshot path
+            // publishes — single source of truth for the D-44..D-47 ship-time defaults.
+            // The existing `default_voice` binding from earlier in the spawn block is
+            // already in scope; no new binding required (Path A per the plan).
+            let mut smoothed = crate::dsp::SmoothedVoiceParams::new(&default_voice, BLOCK, 30.0);
             let mut gate = crate::dsp::Gate::new();
 
             // Phase 2 Plan 02-06: construct the Yin48k F0 estimator (D-32) OFF the audio
@@ -279,7 +285,25 @@ pub fn spawn_dsp_worker(
                     //     write with no allocation) — D-31 assert_no_alloc identical-
                     //     across-branches invariant preserved.
                     assert_no_alloc(|| {
-                        smoothed.step(target_pitch_ratio, target_formant_ratio);
+                        // Plan 03-01: SmoothedVoiceParams.step widened from 2 → 6 targets.
+                        // The four new shaping targets (breath / brightness_db / sibilance
+                        // / mix) are placeholders sourced from the pre-existing
+                        // `default_voice` binding (defined off-RT at line ~156, outlives
+                        // the worker loop). Plan 03-04 will replace these with cached
+                        // values read from `snap_out.read()` alongside target_pitch_ratio
+                        // / target_formant_ratio — that wiring is NOT Plan 03-01's job.
+                        // Until then, the smoother's four new fields stay at their
+                        // ship-time defaults (which match the placeholder targets),
+                        // producing constant — i.e. zero-effect — output for the
+                        // downstream shaping stages once they exist.
+                        smoothed.step(
+                            target_pitch_ratio,
+                            target_formant_ratio,
+                            default_voice.breathiness,
+                            default_voice.brightness_db,
+                            default_voice.sibilance_tame,
+                            default_voice.mix,
+                        );
                         stretch.set_transpose(smoothed.pitch());
                         stretch.set_formant(smoothed.formant());
 
