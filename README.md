@@ -17,16 +17,31 @@ Womanizer is a pure-Rust workspace, but one transitive build dependency requires
 tooling beyond a stock Rust install. **Before running `cargo build` or `cargo test` on a
 clean Windows checkout, install LLVM/Clang.**
 
-**Why:** [`signalsmith-stretch 0.1.3`](https://crates.io/crates/signalsmith-stretch) pulls
-in `bindgen ^0.70` as a build-dependency. `bindgen` parses the C++ headers it generates
-Rust FFI bindings from by invoking `libclang.dll` at build time. Visual Studio Build Tools
-and the MSVC toolchain alone do not ship `libclang.dll` — only the LLVM toolchain does.
+**The fastest path: run the bundled setup script.** From the repo root, in any PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
+```
+
+The script is idempotent — it detects an existing LLVM install and exits cleanly. If
+LLVM isn't present, it prefers `winget` (no admin required) and falls back to `choco`.
+After it finishes, **close and reopen your terminal** so the new `PATH` entries become
+visible, then proceed with `cargo build --release`.
+
+**Why this is needed:** [`signalsmith-stretch 0.1.3`](https://crates.io/crates/signalsmith-stretch)
+pulls in `bindgen ^0.70` as a build-dependency. `bindgen` parses C++ headers and generates
+Rust FFI bindings by invoking `libclang.dll` at build time. Visual Studio Build Tools and
+the MSVC toolchain alone do not ship `libclang.dll` — only the LLVM toolchain does.
 Without it, the first clean build fails with `error: Unable to find libclang`.
 (This is the canonical bindgen-on-Windows pitfall — RESEARCH §Pitfall 3.)
 
-**How to install:**
+**Manual install (if you'd rather not run the script):**
 
-- **Chocolatey (recommended):**
+- **winget:**
+  ```powershell
+  winget install LLVM.LLVM
+  ```
+- **Chocolatey:**
   ```powershell
   choco install llvm
   ```
@@ -34,10 +49,8 @@ Without it, the first clean build fails with `error: Unable to find libclang`.
   [releases.llvm.org](https://releases.llvm.org/). Pick the
   `LLVM-x.y.z-win64.exe` artifact and select "Add LLVM to the system PATH" during install.
 
-After installation, open a fresh shell so `PATH` picks up `libclang.dll`, then proceed
-with `cargo build --release` as normal. CI installs LLVM automatically on the Windows
-runner via `choco install llvm` (see `.github/workflows/ci.yml`); local Windows
-workstations need the one-time install above.
+CI installs LLVM automatically on the Windows runner via `choco install llvm` (see
+`.github/workflows/ci.yml`); local Windows workstations need the one-time install above.
 
 ## Building
 
