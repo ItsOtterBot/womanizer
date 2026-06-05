@@ -107,7 +107,7 @@ fn shaping_chain_per_block_cpu_under_budget() {
 
     // Measurement: 1000 blocks, per-block Instant snapshot.
     let mut elapsed_us = vec![0u64; MEASURE_ITERS];
-    for i in 0..MEASURE_ITERS {
+    for slot in elapsed_us.iter_mut() {
         let block = sine_block_iter(&mut phase);
         let start = Instant::now();
         stretch.process(&block, &mut stretch_out);
@@ -133,7 +133,7 @@ fn shaping_chain_per_block_cpu_under_budget() {
             440.0,
         );
         dry_wet_mix(&block, &breath_out, default_voice.mix, &mut processed);
-        elapsed_us[i] = start.elapsed().as_micros() as u64;
+        *slot = start.elapsed().as_micros() as u64;
     }
 
     // Statistics: median + p95 from sorted per-block elapsed times.
